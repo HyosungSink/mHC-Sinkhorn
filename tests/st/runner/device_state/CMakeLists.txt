@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(mock_ub_conditioner LANGUAGES CXX)
+set(SOC_VERSION Ascend910B3)
+include(${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+ascendc_library(mock_ub_conditioner SHARED conditioner.cpp)
