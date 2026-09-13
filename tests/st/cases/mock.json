@@ -1,0 +1,120 @@
+{
+  "category": "mock",
+  "description": "Five deterministic Sinkhorn workloads with numerical verification and MSPTI kernel timing.",
+  "cases": [
+    {
+      "name": "mock_case_1",
+      "shape": [
+        1,
+        2,
+        4,
+        4
+      ],
+      "dtype": "float16",
+      "iterations": 30,
+      "eps": 1e-06,
+      "pattern": "mock",
+      "mock_input": 1,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "verify": true,
+      "measurement": "kernel",
+      "warmup_us": 400,
+      "repeat": 3
+    },
+    {
+      "name": "mock_case_2",
+      "shape": [
+        1,
+        4,
+        8,
+        8
+      ],
+      "dtype": "float16",
+      "iterations": 50,
+      "eps": 1e-06,
+      "pattern": "mock",
+      "mock_input": 2,
+      "atol": 0.02,
+      "rtol": 0.02,
+      "verify": true,
+      "measurement": "kernel",
+      "repeat": 3
+    },
+    {
+      "name": "mock_case_3",
+      "shape": [
+        1,
+        8,
+        8,
+        8
+      ],
+      "dtype": "float16",
+      "iterations": 20,
+      "eps": 1e-06,
+      "pattern": "mock",
+      "mock_input": 3,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "verify": true,
+      "measurement": "kernel",
+      "matrix_order": [
+        0,
+        1,
+        2,
+        4,
+        3,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "name": "mock_case_4",
+      "shape": [
+        2,
+        4,
+        8,
+        8
+      ],
+      "dtype": "float16",
+      "iterations": 50,
+      "eps": 1e-06,
+      "pattern": "mock",
+      "mock_input": 4,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "verify": true,
+      "measurement": "kernel",
+      "matrix_order": [
+        0,
+        1,
+        2,
+        7,
+        4,
+        5,
+        6,
+        3
+      ]
+    },
+    {
+      "name": "mock_case_5",
+      "shape": [
+        1,
+        16,
+        6,
+        6
+      ],
+      "dtype": "float16",
+      "iterations": 100,
+      "eps": 1e-06,
+      "pattern": "mock",
+      "mock_input": 5,
+      "atol": 0.01,
+      "rtol": 0.01,
+      "verify": true,
+      "measurement": "kernel",
+      "repeat": 3
+    }
+  ]
+}

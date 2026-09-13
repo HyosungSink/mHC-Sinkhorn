@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+st/build/
+st/input/
+st/output/
+
+# Generated fixture exports
+ut/data/
+st/cases/multi_factor_inputs/

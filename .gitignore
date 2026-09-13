@@ -1,0 +1,25 @@
+.DS_Store
+**/.DS_Store
+
+# Local build and generated artifacts
+build/
+dist/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.so
+*.a
+*.run
+
+# Language and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs and runtime output
+log/
+logs/
+*.log
+
+# Local test reports and investigation archives
+/reports/
