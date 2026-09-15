@@ -565,8 +565,12 @@ public:
         } else {
             DataCopy(stage, xGm, 32U);
         }
-        Duplicate(cons, 1.0F, 8);
-        Duplicate(cons, epsValue, 4);
+        if (epsValue > kMinContractEps) {
+            Duplicate(cons, epsValue, 8);
+        } else {
+            Duplicate(cons, 1.0F, 8);
+            Duplicate(cons, epsValue, 4);
+        }
         auto offsets = At<int32_t>(8192);
         auto pattern = At<uint32_t>(8448);
         Duplicate(offsets, static_cast<int32_t>(0), 64);
