@@ -473,8 +473,15 @@ public:
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         Columns(mat);
+        if constexpr (N == 6U) {
+            if (iterations > 1U) {
+                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+            }
+        }
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
-            BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+            if constexpr (N != 6U) {
+                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+            }
             SetVectorMask<float>(kRows * kBatch);
             if constexpr (N == 6U) {
                 Adds<float, false>(sum, sum, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
@@ -485,10 +492,19 @@ public:
             Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
             Columns(mat);
-            if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
-                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-                if (RowsSettled<kRows * kBatch>(sum, probe)) {
-                    break;
+            if constexpr (N == 6U) {
+                if (iteration + 1U < iterations) {
+                    BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+                    if (iteration >= 2U && epsValue > kMinContractEps && RowsSettled<kRows * kBatch>(sum, probe)) {
+                        break;
+                    }
+                }
+            } else {
+                if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
+                    BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+                    if (RowsSettled<kRows * kBatch>(sum, probe)) {
+                        break;
+                    }
                 }
             }
         }
