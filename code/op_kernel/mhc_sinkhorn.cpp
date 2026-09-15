@@ -47,19 +47,18 @@ public:
     __aicore__ inline KernelMhcSinkhorn() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR tiling, const MhcSinkhornTilingData &data) {
-        tiling_ = data;
+        eps_ = data.eps;
         xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
         yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y));
         tableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling) + kTilingWords);
-        pipe_.InitBuffer(arena_, kArenaBytes);
         const uint32_t blockIdx = static_cast<uint32_t>(GetBlockIdx());
-        const uint32_t begin = blockIdx * tiling_.matricesPerCore;
-        const uint32_t end = begin + tiling_.matricesPerCore;
-        first_ = begin < tiling_.matrices ? begin : tiling_.matrices;
-        const uint32_t limit = end < tiling_.matrices ? end : tiling_.matrices;
+        const uint32_t begin = blockIdx * data.matricesPerCore;
+        const uint32_t end = begin + data.matricesPerCore;
+        first_ = begin < data.matrices ? begin : data.matrices;
+        const uint32_t limit = end < data.matrices ? end : data.matrices;
         count_ = limit > first_ ? limit - first_ : 0U;
-        n_ = tiling_.n;
-        iterations_ = tiling_.iterations;
+        n_ = data.n;
+        iterations_ = data.iterations;
     }
 
     __aicore__ inline void Process() {
@@ -77,7 +76,8 @@ public:
 private:
     template <typename U>
     __aicore__ inline LocalTensor<U> At(uint32_t byteOffset) {
-        return arena_.Get<U>()[byteOffset / sizeof(U)];
+        return LocalTensor<U>(TPosition::VECCALC, byteOffset,
+                              (kArenaBytes - byteOffset) / sizeof(U));
     }
 
     // The two per-core constants are produced by vector fills rather than by
@@ -89,7 +89,7 @@ private:
     __aicore__ inline void BuildConstants() {
         LocalTensor<float> cons = At<float>(kOffCons);
         LocalTensor<float> eps = At<float>(kOffEps);
-        const float epsValue = tiling_.eps;
+        const float epsValue = eps_;
         // The guard vector is one full fill followed by a narrow fill from lane
         // zero: a partial fill at lane n would start off the 32B boundary.
         // The padding lanes keep 1.0 so that a zero column can never divide by
@@ -284,7 +284,7 @@ private:
         // schedule converges to. The test follows the normalization, so the tile
         // that is left behind is the column-normalized iterate the schedule would
         // have emitted, and no probe is spent on a tile that cannot be settled.
-        const bool contractive = tiling_.eps > kMinContractEps;
+        const bool contractive = eps_ > kMinContractEps;
         for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
                                          static_cast<int32_t>(kRowLanes));
@@ -302,31 +302,45 @@ private:
             // test, so only the valid n rows are read back.
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
                                          static_cast<int32_t>(kRowLanes));
-            Sync<HardEvent::V_S>();
-            float high = sum.GetValue(0);
-            float low = high;
-            for (uint32_t row = 1; row < n_; ++row) {
-                const float value = sum.GetValue(static_cast<int32_t>(row));
-                if (value > high) {
-                    high = value;
+            if (n_ == 6U) {
+                Sync<HardEvent::V_S>();
+                float high = sum.GetValue(0);
+                float low = high;
+                for (uint32_t row = 1; row < n_; ++row) {
+                    const float value = sum.GetValue(static_cast<int32_t>(row));
+                    if (value > high) {
+                        high = value;
+                    }
+                    if (value < low) {
+                        low = value;
+                    }
                 }
-                if (value < low) {
-                    low = value;
+                if (high - 1.0F <= kSettledDev && 1.0F - low <= kSettledDev) {
+                    break;
                 }
-            }
-            if (high - 1.0F <= kSettledDev && 1.0F - low <= kSettledDev) {
-                break;
+            } else {
+                SetVectorMask<float>(static_cast<int32_t>(n_));
+                Adds<float, false>(tmpA, sum, -1.0F, MASK_PLACEHOLDER, 1,
+                                    UnaryRepeatParams(1, 1, 8, 8));
+                Abs<float, false>(tmpA, tmpA, MASK_PLACEHOLDER, 1,
+                                   UnaryRepeatParams(1, 1, 8, 8));
+                WholeReduceMax<float, false>(tmpB, tmpA, MASK_PLACEHOLDER,
+                    1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                Sync<HardEvent::V_S>();
+                const float deviation = tmpB.GetValue(0);
+                SetVectorMask<float>(static_cast<int32_t>(kLanes));
+                if (deviation <= kSettledDev) {
+                    break;
+                }
             }
         }
 
     }
 
-    TPipe pipe_;
-    TBuf<TPosition::VECCALC> arena_;
     GlobalTensor<DT_X> xGm_;
     GlobalTensor<DT_X> yGm_;
     GlobalTensor<uint32_t> tableGm_;
-    MhcSinkhornTilingData tiling_{};
+    float eps_;
     uint32_t first_ = 0;
     uint32_t count_ = 0;
     uint32_t n_ = 0;
@@ -355,4 +369,5 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     KernelMhcSinkhorn<DT_X> op;
     op.Init(logits, weights, tiling, tiling_data);
     op.Process();
+    PipeBarrier<PIPE_ALL>();
 }
