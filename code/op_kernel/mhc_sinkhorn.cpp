@@ -351,6 +351,9 @@ template <typename DT_X, uint32_t N>
 class KernelMhcSinkhornPair {
     static constexpr uint32_t kBatch = N == 4U ? 2U : 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
+    static constexpr uint32_t kRows = N == 6U ? 6U : 8U;
+    static constexpr uint32_t kRepeats = kRows * kBatch / 8U;
+    static constexpr uint32_t kPairLanes = 2U * kRows * 8U;
     template <typename U>
     __aicore__ inline LocalTensor<U> At(uint32_t offset) {
         return LocalTensor<U>(TPosition::VECCALC, offset, 2048U / sizeof(U));
@@ -360,13 +363,24 @@ class KernelMhcSinkhornPair {
         auto b = At<float>(4096);
         auto col = At<float>(10240);
         auto div = At<float>(8192);
-        Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        Add<float, false>(b, a, a[16], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        Add<float, false>(col, b, b[32], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        SetVectorMask<float>(8);
-        Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 0});
-        SetVectorMask<float>(64);
-        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 8});
+        if constexpr (N == 6U) {
+            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 2, 2, 8, 16, 16});
+            SetVectorMask<float>(32);
+            Add<float, false>(b, a, a[8], MASK_PLACEHOLDER, 1, {1, 3, 3, 8, 24, 24});
+            Add<float, false>(col, b, a[16], MASK_PLACEHOLDER, 1, {1, 1, 3, 8, 8, 24});
+            Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
+            SetVectorMask<float>(48);
+            Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 6, 6, 1});
+            SetVectorMask<float>(64);
+        } else {
+            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
+            Add<float, false>(b, a, a[16], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
+            Add<float, false>(col, b, b[32], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
+            SetVectorMask<float>(8);
+            Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 0});
+            SetVectorMask<float>(64);
+            Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 8});
+        }
     }
 public:
     __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
@@ -389,7 +403,7 @@ public:
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
         if constexpr (N < 8U) {
-            DataCopyPad(table, tables, DataCopyExtParams{1, 208U * sizeof(uint32_t), 0, 0, 0},
+            DataCopyPad(table, tables, DataCopyExtParams{1, (N == 6U ? 168U : 208U) * sizeof(uint32_t), 0, 0, 0},
                         DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         }
         if constexpr (sizeof(DT_X) == sizeof(float)) {
@@ -401,12 +415,8 @@ public:
                         DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
         }
         if constexpr (N < 8U) {
-            Duplicate(cons, 1.0F, 8U * kBatch);
-            SetVectorMask<float>(N);
-            Duplicate<float, false>(cons, data.eps, MASK_PLACEHOLDER, kBatch, 1, 1);
-            Duplicate(eps, 0.0F, 64U * kBatch);
-            SetVectorMask<float>(N);
-            Adds<float, false>(eps, eps, data.eps, MASK_PLACEHOLDER, 8U * kBatch, {1, 1, 1, 1});
+            Duplicate(cons, 1.0F, 8);
+            Duplicate(cons, data.eps, N);
             for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
                 compact.SetValue(252U + pair * 2U * N * N, kNegHuge);
             }
@@ -422,35 +432,40 @@ public:
         }
         if constexpr (N < 8U) {
             for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
-                Gather(mat[pair * 128U], compact[pair * 2U * N * N], table, 0, 128);
+                Gather(mat[pair * kPairLanes], compact[pair * 2U * N * N], table, 0, kPairLanes);
             }
         }
         SetVectorMask<float>(64);
-        BlockReduceMax<float, false>(sum, mat, kBatch, MASK_PLACEHOLDER, 1, 1, 8);
-        Brcb(div, sum, kBatch, BrcbRepeatParams(1, 8));
-        Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        Exp<float, false>(mat, mat, MASK_PLACEHOLDER, kBatch, {1, 1, 8, 8});
-        BlockReduceSum<float, false>(sum, mat, kBatch, MASK_PLACEHOLDER, 1, 1, 8);
-        Brcb(div, sum, kBatch, BrcbRepeatParams(1, 8));
-        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-        if constexpr (N < 8U) {
-            SetVectorMask<float>((8U - N) * 8U);
-            Duplicate<float, false>(mat[N * 8U], 0.0F, MASK_PLACEHOLDER, kBatch, 1, 8);
+        BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
+        Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
+        Exp<float, false>(mat, mat, MASK_PLACEHOLDER, kRepeats, {1, 1, 8, 8});
+        BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
+        if constexpr (N == 6U) {
+            SetVectorMask<float>(6);
+            Adds<float, false>(mat, mat, data.eps, MASK_PLACEHOLDER, 24, {1, 1, 1, 1});
             SetVectorMask<float>(64);
+        } else {
+            Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         }
         Columns(mat);
         for (uint32_t iteration = 1; iteration < data.iterations; ++iteration) {
-            BlockReduceSum<float, false>(sum, mat, kBatch, MASK_PLACEHOLDER, 1, 1, 8);
-            SetVectorMask<float>(8U * kBatch);
-            Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+            BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+            SetVectorMask<float>(kRows * kBatch);
+            if constexpr (N == 6U) {
+                Adds<float, false>(sum, sum, data.eps, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            } else {
+                Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+            }
             SetVectorMask<float>(64);
-            Brcb(div, sum, kBatch, BrcbRepeatParams(1, 8));
-            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
+            Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
+            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
             Columns(mat);
             if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
-                BlockReduceSum<float, false>(sum, mat, kBatch, MASK_PLACEHOLDER, 1, 1, 8);
-                SetVectorMask<float>(0, ((1ULL << N) - 1ULL) * (kBatch == 2U ? 0x101ULL : 0x1010101ULL));
+                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
+                SetVectorMask<float>(kRows * kBatch);
                 Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
                 Abs<float, false>(probe, probe, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
                 WholeReduceMax<float, false>(probe[64], probe, MASK_PLACEHOLDER,
@@ -465,7 +480,7 @@ public:
         }
         if constexpr (N < 8U) {
             for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
-                Gather(compact[pair * 2U * N * N], mat[pair * 128U], table[128], 0, 2U * N * N);
+                Gather(compact[pair * 2U * N * N], mat[pair * kPairLanes], table[kPairLanes], 0, 2U * N * N);
             }
         }
         auto packed = N < 8U ? compact : mat;
