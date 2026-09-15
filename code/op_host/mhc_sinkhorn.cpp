@@ -129,7 +129,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
     }
 
-    uint32_t payloadBytes = STATIC_ITERATIONS != 0U ? 0U :
+    uint32_t payloadBytes = STATIC_ITERATIONS != 0U && order != 6U ? 0U :
         (ACTIVE_GROUPS != 0U ? 2U * sizeof(uint32_t) : kTilingWords * sizeof(uint32_t));
     if (ACTIVE_GROUPS == 0U && order < 8U) {
         payloadBytes = (kTilingWords + kGatherWords) * sizeof(uint32_t);
