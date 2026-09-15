@@ -91,18 +91,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     // therefore ask for an octet of blocks and let the idle ones return
     // immediately; larger batches keep one matrix per block up to the core count.
     const uint32_t headBlocks = std::min<uint32_t>(kHeadBlocks, cores);
-    const uint32_t tasks = order == 6U ? (matrices + 1U) / 2U : matrices;
+    const uint32_t tasks = (matrices + 1U) / 2U;
     const uint32_t blockCount = std::min(std::max(tasks, headBlocks), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS);
+    const uint32_t matricesPerCore = tasks <= cores ? 2U : (matrices + blockCount - 1U) / blockCount;
+    const uint32_t GROUP_ORDER = matricesPerCore == 2U ? order : 0U;
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
     if (tiling == nullptr) {
         return ge::GRAPH_FAILED;
     }
     tiling->matrices = matrices;
-    tiling->matricesPerCore = (matrices + blockCount - 1U) / blockCount;
+    tiling->matricesPerCore = matricesPerCore;
     tiling->n = order;
     tiling->iterations = static_cast<uint32_t>(iterations);
     tiling->eps = eps;
@@ -132,14 +134,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         const uint32_t batch = slot / 64U;
         const uint32_t row = (slot % 64U) / 8U;
         const uint32_t column = slot % 8U;
-        tiling->pairGather[slot] = (row < 6U && column < 6U ?
-            batch * 36U + row * 6U + column : 120U) * sizeof(float);
+        tiling->pairGather[slot] = (row < order && column < order ?
+            batch * order * order + row * order + column : 120U) * sizeof(float);
     }
     for (uint32_t slot = 0; slot < 80U; ++slot) {
-        const uint32_t batch = slot / 36U;
-        const uint32_t row = (slot % 36U) / 6U;
-        const uint32_t column = slot % 6U;
-        tiling->pairGather[128U + slot] = (slot < 72U ?
+        const uint32_t batch = slot / (order * order);
+        const uint32_t row = (slot % (order * order)) / order;
+        const uint32_t column = slot % order;
+        tiling->pairGather[128U + slot] = (slot < 2U * order * order ?
             batch * 64U + row * 8U + column : 0U) * sizeof(float);
     }
 
