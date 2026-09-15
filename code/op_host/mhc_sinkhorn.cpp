@@ -84,13 +84,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const int32_t aivCores = platform.GetCoreNumAiv();
     const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
     // Each task holds a complete group of independent matrices.
-    const uint32_t groupMatrices = order == 4U ? 2U : 4U;
+    const uint32_t groupMatrices = order == 6U ? 4U : 2U;
     const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
     const uint32_t blockCount = std::min(std::max(tasks, 8U), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
-    const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
+    // Layout 9 is the two-matrix variant for order 8.
+    const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? (order == 8U ? 9U : order) : 0U;
     const uint32_t ACTIVE_GROUPS = GROUP_ORDER != 0U && matrices % groupMatrices == 0U &&
         (tasks == 1U || tasks == 2U || tasks == 4U) ? tasks : 0U;
     ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS);
