@@ -559,6 +559,9 @@ public:
         auto table = At<uint32_t>(8192);
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
+        GlobalTensor<uint64_t> packedGm;
+        const bool scalarInput = sizeof(DT_X) != sizeof(float) &&
+            (reinterpret_cast<uint64_t>(x) & 63ULL) == 0ULL;
         auto rowSeed = At<uint64_t>(3072);
         auto columnSeed = At<uint64_t>(4096);
         rowSeed.SetValue(0, 0x0000001000000000ULL);
@@ -572,6 +575,10 @@ public:
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             DataCopyPad(compact, xGm, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0},
                         DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
+        } else if (scalarInput) {
+            packedGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(x) + first * 4U, 8U);
+            DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(packedGm);
+            DataCachePreload(packedGm, static_cast<int64_t>(0));
         } else {
             DataCopyPad(stage, xGm, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0},
                         DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
@@ -586,9 +593,20 @@ public:
         Add<int32_t, false>(offsets, offsets, At<int32_t>(4096), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
         Duplicate(pattern, 0x0F0F0F0FU, 8);
         Duplicate(mat, kNegHuge, 64);
-        Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) != sizeof(float)) {
+            if (scalarInput) {
+                auto packedStage = At<uint64_t>(6144);
+#pragma unroll
+                for (uint32_t word = 0; word < 8U; ++word) {
+                    packedStage.SetValue(word, packedGm.GetValue(word));
+                }
+                Sync<HardEvent::S_V>();
+            } else {
+                Sync<HardEvent::MTE2_V>();
+            }
             Cast(compact, stage, RoundMode::CAST_NONE, 32);
+        } else {
+            Sync<HardEvent::MTE2_V>();
         }
         uint64_t validRows[2] = {0x0F0F0F0F0F0F0F0FULL, 0ULL};
         Gather(mat, compact, table, 0, validRows, 1, 8);
