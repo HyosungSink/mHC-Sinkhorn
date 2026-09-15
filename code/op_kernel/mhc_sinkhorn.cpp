@@ -31,10 +31,13 @@ constexpr uint32_t kOffCol = 3200;    // column divisor slot (256B)
 constexpr uint32_t kOffPrev = 3456;   // previous-iteration tile snapshot (256B)
 constexpr uint32_t kArenaBytes = 3712;
 
-template <AscendC::HardEvent event>
+// Flags are a shared resource: two independent Sync pairs that share one event
+// id can consume each other's flag when their setting pipes finish out of
+// order, so the load's wait uses its own id.
+template <AscendC::HardEvent event, int32_t id = EVENT_ID0>
 __aicore__ inline void Sync() {
-    AscendC::SetFlag<event>(EVENT_ID0);
-    AscendC::WaitFlag<event>(EVENT_ID0);
+    AscendC::SetFlag<event>(id);
+    AscendC::WaitFlag<event>(id);
 }
 }  // namespace
 
@@ -62,12 +65,14 @@ public:
         if (count_ == 0U) {
             return;
         }
-        BuildConstants();
         // One continuous mask for the whole run: every hot-path vector op takes
         // this mask instead of programming its own.
         SetVectorMask<float>(static_cast<int32_t>(kLanes));
+        BuildConstants();
         for (uint32_t index = 0; index < count_; ++index) {
+            LoadMatrix(first_ + index);
             ProcessMatrix(first_ + index);
+            StoreMatrix(first_ + index);
         }
     }
 
@@ -86,18 +91,20 @@ private:
         LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
         LocalTensor<float> epsSeed = At<float>(kOffCons + 128);  // scratch low block
         const float eps = tiling_.eps;
-        // cons carries the eight lane pattern eps..eps,1..1; the gather offsets
-        // are byte strides 0,4,...,28 repeated per block. epsVec is that same
-        // eight lane pattern replicated onto every block, which is exactly the
-        // column broadcast the gather index describes.
+        // cons carries the eight lane pattern eps..eps,1..1 on the low lanes.
+        // The gather offsets are the byte strides 0,4,...,28 repeated per block;
+        // building them from a lane index costs four instructions instead of a
+        // scalar store per lane, which matters at this kernel size.
+        LocalTensor<int32_t> lanes = At<int32_t>(kOffIndex);
+        LocalTensor<int32_t> laneMod = At<int32_t>(kOffDiv);  // scratch, reused later
         for (uint32_t lane = 0; lane < kRowLanes; ++lane) {
             const bool inside = lane < n_;
             cons.SetValue(lane, inside ? eps : 1.0F);
             epsSeed.SetValue(lane, inside ? eps : 0.0F);
-            index.SetValue(lane, lane * static_cast<uint32_t>(sizeof(float)));
         }
-        for (uint32_t lane = kRowLanes; lane < kLanes; ++lane) {
-            index.SetValue(lane, (lane % kRowLanes) * static_cast<uint32_t>(sizeof(float)));
+        (void)laneMod;
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+            lanes.SetValue(lane, static_cast<int32_t>((lane % kRowLanes) * sizeof(float)));
         }
         Sync<HardEvent::S_V>();
         Gather(epsVec, epsSeed, index, 0, static_cast<uint32_t>(kLanes));
@@ -118,12 +125,25 @@ private:
         // staging buffers, so both must retire before this load overwrites them.
         Sync<HardEvent::MTE3_MTE2>();
         Sync<HardEvent::V_MTE2>();
+        // An 8x8 matrix already fills the padded tile with no gaps, so the whole
+        // block is one contiguous burst instead of one burst per row. Small
+        // strided bursts are the dominant cost at this tensor size.
+        const bool packed = (n_ == kRowLanes);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
-            DataCopyExtParams copy{static_cast<uint16_t>(n_),
-                                   static_cast<uint32_t>(n_ * sizeof(float)), 0, 0, 0};
+            const uint32_t rowBytes = n_ * sizeof(float);
+            DataCopyExtParams copy{static_cast<uint16_t>(packed ? 1U : n_),
+                                   packed ? rowBytes * n_ : rowBytes, 0, 0, 0};
             DataCopyPadExtParams<float> pad{true, 0, static_cast<uint8_t>(kRowLanes - n_), kNegHuge};
             DataCopyPad(mat, xGm_[offset], copy, pad);
             Sync<HardEvent::MTE2_V>();
+        } else if (packed) {
+            LocalTensor<DT_X> stage = At<DT_X>(kOffStage);
+            DataCopyExtParams copy{1, static_cast<uint32_t>(kLanes * sizeof(DT_X)), 0, 0, 0};
+            DataCopyPadExtParams<DT_X> pad{false, 0, 0, static_cast<DT_X>(0)};
+            DataCopyPad(stage, xGm_[offset], copy, pad);
+            Sync<HardEvent::MTE2_V>();
+            Cast(mat, stage, RoundMode::CAST_NONE, static_cast<int32_t>(kLanes));
+            Sync<HardEvent::V_MTE2>();
         } else {
             LocalTensor<DT_X> stage = At<DT_X>(kOffStage);
             DataCopyExtParams copy{static_cast<uint16_t>(n_),
@@ -144,11 +164,20 @@ private:
     __aicore__ inline void StoreMatrix(uint32_t matrix) {
         LocalTensor<float> mat = At<float>(kOffMat);
         const uint64_t offset = static_cast<uint64_t>(matrix) * n_ * n_;
+        const bool packed = (n_ == kRowLanes);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
-            DataCopyExtParams copy{static_cast<uint16_t>(n_),
-                                   static_cast<uint32_t>(n_ * sizeof(float)), 0, 0, 0};
+            const uint32_t rowBytes = n_ * sizeof(float);
+            DataCopyExtParams copy{static_cast<uint16_t>(packed ? 1U : n_),
+                                   packed ? rowBytes * n_ : rowBytes, 0, 0, 0};
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm_[offset], mat, copy);
+        } else if (packed) {
+            LocalTensor<DT_X> stage = At<DT_X>(kOffOut);
+            Sync<HardEvent::MTE3_V>();
+            Cast(stage, mat, RoundMode::CAST_NONE, static_cast<int32_t>(kLanes));
+            Sync<HardEvent::V_MTE3>();
+            DataCopyExtParams copy{1, static_cast<uint32_t>(kLanes * sizeof(DT_X)), 0, 0, 0};
+            DataCopyPad(yGm_[offset], stage, copy);
         } else {
             LocalTensor<DT_X> stage = At<DT_X>(kOffOut);
             Sync<HardEvent::MTE3_V>();
@@ -217,8 +246,6 @@ private:
         LocalTensor<float> prev = At<float>(kOffPrev);
         LocalTensor<float> chkMax = At<float>(kOffPrev + 128);
 
-        LoadMatrix(matrix);
-
         // softmax over the last axis: row maximum, exp, row sum, normalize.
         BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, static_cast<int32_t>(kRowLanes));
         Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
@@ -273,7 +300,6 @@ private:
             Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
         }
 
-        StoreMatrix(matrix);
     }
 
     TPipe pipe_;
