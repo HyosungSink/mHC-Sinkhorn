@@ -423,11 +423,9 @@ public:
         auto output = At<DT_X>(24576);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             auto input = N < 8U ? compact : mat;
-            DataCopyPad(input, xGm, DataCopyExtParams{1, kElements * sizeof(float), 0, 0, 0},
-                        DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
+            DataCopy(input, xGm, kElements);
         } else {
-            DataCopyPad(stage, xGm, DataCopyExtParams{1, kElements * sizeof(DT_X), 0, 0, 0},
-                        DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
+            DataCopy(stage, xGm, kElements);
         }
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
@@ -522,11 +520,11 @@ public:
         auto packed = N < 8U ? compact : mat;
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             Sync<HardEvent::V_MTE3>();
-            DataCopyPad(yGm, packed, DataCopyExtParams{1, kElements * sizeof(float), 0, 0, 0});
+            DataCopy(yGm, packed, kElements);
         } else {
             Cast(output, packed, RoundMode::CAST_NONE, kElements);
             Sync<HardEvent::V_MTE3>();
-            DataCopyPad(yGm, output, DataCopyExtParams{1, kElements * sizeof(DT_X), 0, 0, 0});
+            DataCopy(yGm, output, kElements);
         }
     }
 };
@@ -565,11 +563,9 @@ public:
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
-            DataCopyPad(compact, xGm, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0},
-                        DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
+            DataCopy(compact, xGm, 32U);
         } else {
-            DataCopyPad(stage, xGm, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0},
-                        DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
+            DataCopy(stage, xGm, 32U);
         }
         Duplicate(cons, 1.0F, 8);
         Duplicate(cons, epsValue, 4);
@@ -625,11 +621,11 @@ public:
         GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             Sync<HardEvent::V_MTE3>();
-            DataCopyPad(yGm, compact, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0});
+            DataCopy(yGm, compact, 32U);
         } else {
             Cast(output, compact, RoundMode::CAST_NONE, 32);
             Sync<HardEvent::V_MTE3>();
-            DataCopyPad(yGm, output, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0});
+            DataCopy(yGm, output, 32U);
         }
     }
 };
