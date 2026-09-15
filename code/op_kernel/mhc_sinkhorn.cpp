@@ -9,7 +9,10 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
-constexpr uint32_t kProbeEvery = 4;   // iteration stride of the fixed-point probe
+constexpr uint32_t kProbeEvery = 4;   // iteration stride of the convergence probe
+constexpr float kSettledStep = 1.0e-6F;
+constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction  // largest lane move that still counts as settled
+constexpr uint32_t kMinIterations = 2;  // steps before the first convergence probe
 constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
 
 // UB arena layout in bytes. Every matrix lives in a padded 8x8 fp32 tile whose
@@ -179,16 +182,23 @@ private:
 
     // The tile is reproducible bit for bit, so every later iteration is an
     // identity and the loop can stop.
+    // The finished step moved no lane by more than kSettledStep, so what the
+    // caller sees is already within a few ulp of every later iterate. That
+    // argument needs the normalization to stay contractive: with an eps so
+    // small that normalized entries can underflow, the map loses that property
+    // and only a bit exact fixed point is trusted, so the whole requested
+    // schedule runs.
     __aicore__ inline bool TileSettled(const LocalTensor<float> &mat,
                                        const LocalTensor<float> &prev,
                                        const LocalTensor<float> &scratch,
-                                       const LocalTensor<float> &chk) {
+                                       const LocalTensor<float> &chkMax) {
         Sub(scratch, mat, prev, static_cast<int32_t>(kLanes));
         Abs(scratch, scratch, static_cast<int32_t>(kLanes));
-        BlockReduceMax<float, false>(chk, scratch, 1, MASK_PLACEHOLDER, 1, 1,
+        WholeReduceMax<float, false>(chkMax, scratch, MASK_PLACEHOLDER, 1, 1, 1,
                                      static_cast<int32_t>(kRowLanes));
         Sync<HardEvent::V_S>();
-        const bool settled = chk.GetValue(0) == 0.0F;
+        const bool contracted = tiling_.eps > kMinContractEps;
+        const bool settled = contracted && chkMax.GetValue(0) <= kSettledStep;
         SetVectorMask<float>(static_cast<int32_t>(kLanes));
         return settled;
     }
@@ -202,6 +212,7 @@ private:
         LocalTensor<float> cons = At<float>(kOffCons);
         LocalTensor<float> col = At<float>(kOffCol);
         LocalTensor<float> prev = At<float>(kOffPrev);
+        LocalTensor<float> chkMax = At<float>(kOffPrev + 128);
 
         LoadMatrix(matrix);
 
@@ -233,7 +244,8 @@ private:
             Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinParams());
             NormalizeColumns(mat, tmpA, tmpB, sum, div, cons, col);
-            if ((iteration & (kProbeEvery - 1U)) == 0U && TileSettled(mat, prev, tmpA, sum)) {
+            if (iteration >= kMinIterations && (iteration & (kProbeEvery - 1U)) == 0U &&
+                TileSettled(mat, prev, tmpA, chkMax)) {
                 break;
             }
             Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
