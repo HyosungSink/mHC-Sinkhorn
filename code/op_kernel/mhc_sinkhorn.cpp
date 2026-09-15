@@ -695,3 +695,16 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
 #ifndef cce_kernel
 #define cce_kernel cce_kernel, aligned(2048)
 #endif
+
+// These standalone release kernels use static UB and no system-workspace API.
+#if (!defined(ASCENDC_CPU_DEBUG) || ASCENDC_CPU_DEBUG == 0) && \
+    !defined(ASCENDC_DUMP) && !defined(ASCENDC_TIME_STAMP_ON) && !defined(ASCENDC_ACC_DUMP)
+namespace AscendC {
+__aicore__ inline void MhcSinkhornInitWorkspace(GM_ADDR) {}
+__aicore__ inline GM_ADDR MhcSinkhornUserWorkspace(GM_ADDR workspace) {
+    return workspace + RESERVED_WORKSPACE;
+}
+}
+#define SetSysWorkspaceForce MhcSinkhornInitWorkspace
+#define GetUserWorkspace MhcSinkhornUserWorkspace
+#endif
