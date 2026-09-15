@@ -415,10 +415,11 @@ public:
         auto stage = At<DT_X>(16384);
         auto compact = At<float>(18432);
         auto table = At<uint32_t>(20480);
+        auto pattern = At<uint32_t>(21248);
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
         if constexpr (N < 8U) {
-            DataCopyPad(table, tables, DataCopyExtParams{1, 336U * sizeof(uint32_t), 0, 0, 0},
+            DataCopyPad(table, tables, DataCopyExtParams{1, kGroupLanes * sizeof(uint32_t), 0, 0, 0},
                         DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         }
         if constexpr (sizeof(DT_X) == sizeof(float)) {
@@ -432,6 +433,7 @@ public:
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
+            Duplicate(pattern, 0x3F3F3F3FU, 8);
             compact.SetValue(252U, kNegHuge);
             Sync<HardEvent::S_V>();
         } else {
@@ -482,7 +484,8 @@ public:
             }
         }
         if constexpr (N < 8U) {
-            Gather(compact, mat, table[kGroupLanes], 0, kElements);
+            uint64_t selected = 0;
+            GatherMask(compact, mat, pattern, true, 64, {1, kRepeats, 8, 0}, selected);
         }
         auto packed = N < 8U ? compact : mat;
         if constexpr (sizeof(DT_X) == sizeof(float)) {
