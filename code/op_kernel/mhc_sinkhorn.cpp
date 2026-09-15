@@ -322,7 +322,21 @@ template <typename DT_X>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
                                         GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
-    GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
+    // The six fields this kernel needs are read straight from the tiling block
+    // as scalars. The structured copy would move the whole block onto the stack
+    // first, and at this kernel size that copy alone costs a few hundred
+    // nanoseconds, more than the arithmetic it describes.
+    __gm__ const MhcSinkhornTilingData *raw =
+        reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
+    MhcSinkhornTilingData tiling_data;
+    tiling_data.matrices = raw->matrices;
+    tiling_data.matricesPerCore = raw->matricesPerCore;
+    tiling_data.n = raw->n;
+    tiling_data.iterations = raw->iterations;
+    tiling_data.eps = raw->eps;
+    tiling_data.dtypeSize = raw->dtypeSize;
+    tiling_data.reserved0 = 0U;
+    tiling_data.reserved1 = 0U;
     KernelMhcSinkhorn<DT_X> op;
     op.Init(logits, weights, tiling_data);
     op.Process();
