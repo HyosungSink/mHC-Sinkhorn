@@ -14,6 +14,8 @@ constexpr uint32_t kMaxOrder = 8;
 constexpr uint32_t kMaxIterations = 100;
 constexpr uint32_t kSingleMatrixDims = 3;
 constexpr uint32_t kBatchMatrixDims = 4;
+constexpr uint32_t kTileWidth = 8;    // padded tile row width in fp32 lanes
+constexpr uint32_t kSentinelSlot = 60;  // compact slot the padding lanes read (-inf)
 constexpr uint32_t kHeadBlocks = 8;  // block count with the lowest measured head cost
 
 bool SupportedOrder(int64_t order) {
@@ -107,6 +109,24 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling->dtypeSize = static_cast<uint32_t>(ge::GetSizeByDataType(tensor_x->GetDataType()));
     tiling->reserved0 = 0U;
     tiling->reserved1 = 0U;
+    // Byte offsets of the two indexed copies that move a narrow matrix between
+    // its compact n*n form and the padded 8x8 tile. Padding lanes and padding
+    // rows all point at one sentinel slot past the matrix, which the kernel
+    // primes with -inf so the softmax turns them into zeros.
+    for (uint32_t slot = 0; slot < 64U; ++slot) {
+        const uint32_t row = slot / kTileWidth;
+        const uint32_t column = slot % kTileWidth;
+        const bool inside = row < order && column < order;
+        tiling->gather[slot] = (inside ? (row * order + column) : kSentinelSlot) *
+                               static_cast<uint32_t>(sizeof(float));
+    }
+    for (uint32_t slot = 0; slot < 64U; ++slot) {
+        uint32_t offset = 0U;
+        if (slot < order * order) {
+            offset = (slot / order) * kTileWidth + (slot % order);
+        }
+        tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
+    }
 
     context->SetBlockDim(blockCount);
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);

@@ -15,4 +15,12 @@ struct MhcSinkhornTilingData {
     uint32_t dtypeSize;        // input element size in bytes (2 or 4)
     uint32_t reserved0;
     uint32_t reserved1;
+    // Byte offsets for the two indexed copies that move a narrow matrix between
+    // its compact n*n form and the padded tile: the first 64 entries address one
+    // tile lane each, the next 64 address one compact element each. Computing
+    // them on the host keeps every per-row address out of the kernel.
+    uint32_t gather[128];
 };
+
+constexpr uint32_t kTilingWords = 8;    // scalar fields before gather[]
+constexpr uint32_t kGatherWords = 128;  // 64 expand offsets + 64 compact offsets
