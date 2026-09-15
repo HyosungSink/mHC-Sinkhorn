@@ -82,16 +82,28 @@ private:
         LocalTensor<float> cons = At<float>(kOffCons);
         LocalTensor<float> epsVec = At<float>(kOffEps);
         LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
+        LocalTensor<float> epsSeed = At<float>(kOffCons + 128);  // scratch low block
         const float eps = tiling_.eps;
-        for (uint32_t lane = 0; lane < kLanes; ++lane) {
-            const uint32_t column = lane % kRowLanes;
-            const bool inside = column < n_;
+        // cons carries the eight lane pattern eps..eps,1..1; the gather offsets
+        // are byte strides 0,4,...,28 repeated per block. epsVec is that same
+        // eight lane pattern replicated onto every block, which is exactly the
+        // column broadcast the gather index describes.
+        for (uint32_t lane = 0; lane < kRowLanes; ++lane) {
+            const bool inside = lane < n_;
             cons.SetValue(lane, inside ? eps : 1.0F);
-            epsVec.SetValue(lane, inside ? eps : 0.0F);
-            index.SetValue(lane, column * static_cast<uint32_t>(sizeof(float)));
+            epsSeed.SetValue(lane, inside ? eps : 0.0F);
+            index.SetValue(lane, lane * static_cast<uint32_t>(sizeof(float)));
+        }
+        for (uint32_t lane = kRowLanes; lane < kLanes; ++lane) {
+            index.SetValue(lane, (lane % kRowLanes) * static_cast<uint32_t>(sizeof(float)));
         }
         Sync<HardEvent::S_V>();
+        Gather(epsVec, epsSeed, index, 0, static_cast<uint32_t>(kLanes));
+        SetVectorMask<float>(static_cast<int32_t>(kLanes));
     }
+
+
+
 
     __aicore__ inline BinaryRepeatParams BinParams() const {
         return BinaryRepeatParams(1, 1, 1, 8, 8, 8);
