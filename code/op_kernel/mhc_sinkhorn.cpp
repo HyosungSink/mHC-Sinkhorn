@@ -11,7 +11,7 @@ constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
 constexpr float kSettledDev = 1.0e-3F;  // row-sum residual still accepted as settled
 constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction
-constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
+constexpr float kNegHuge = -__builtin_inff();  // keeps padding lanes out of the row maximum
 
 // UB arena layout in bytes. Every matrix lives in a padded 8x8 fp32 tile whose
 // rows are separated by one 32B data block, so block level reductions act on
@@ -480,6 +480,108 @@ public:
     }
 };
 
+template <typename DT_X>
+class KernelMhcSinkhornNarrowPair {
+    template <typename U>
+    __aicore__ inline LocalTensor<U> At(uint32_t offset) {
+        return LocalTensor<U>(TPosition::VECCALC, offset, 1024U / sizeof(U));
+    }
+    __aicore__ inline void Columns(const LocalTensor<float> &mat) {
+        auto a = At<float>(1024);
+        auto col = At<float>(2048);
+        auto div = At<float>(4096);
+        Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+        Add<float, false>(col, a, a[16], MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+        SetVectorMask<float>(8);
+        Add<float, false>(col, col, At<float>(5120), MASK_PLACEHOLDER, 2, {1, 1, 1, 4, 4, 0});
+        SetVectorMask<float>(32);
+        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, 2, {1, 1, 0, 4, 4, 4});
+        SetVectorMask<float>(64);
+    }
+public:
+    __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
+                                    const MhcSinkhornTilingData &data) {
+        GlobalTensor<DT_X> xGm;
+        GlobalTensor<DT_X> yGm;
+        GlobalTensor<uint32_t> tables;
+        const uint64_t first = static_cast<uint64_t>(GetBlockIdx()) * 2U;
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x) + first * 16U);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y) + first * 16U);
+        tables.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling) + kTilingWords + kGatherWords);
+        auto mat = At<float>(0);
+        auto sum = At<float>(3072);
+        auto div = At<float>(4096);
+        auto cons = At<float>(5120);
+        auto stage = At<DT_X>(6144);
+        auto compact = At<float>(7168);
+        auto table = At<uint32_t>(8192);
+        auto probe = At<float>(9216);
+        auto output = At<DT_X>(10240);
+        DataCopyPad(table, tables, DataCopyExtParams{1, 96U * sizeof(uint32_t), 0, 0, 0},
+                    DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            DataCopyPad(compact, xGm, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0},
+                        DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
+        } else {
+            DataCopyPad(stage, xGm, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0},
+                        DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
+        }
+        Duplicate(cons, 1.0F, 8);
+        Duplicate(cons, data.eps, 4);
+        compact.SetValue(252, kNegHuge);
+        Sync<HardEvent::S_V>();
+        Sync<HardEvent::MTE2_V>();
+        if constexpr (sizeof(DT_X) != sizeof(float)) {
+            Cast(compact, stage, RoundMode::CAST_NONE, 32);
+        }
+        Gather(mat, compact, table, 0, 64);
+        SetVectorMask<float>(64);
+        BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
+        Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+        Exp<float, false>(mat, mat, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+        SetVectorMask<float>(4);
+        Adds<float, false>(mat, mat, data.eps, MASK_PLACEHOLDER, 8, {1, 1, 1, 1});
+        SetVectorMask<float>(64);
+        Columns(mat);
+        for (uint32_t iteration = 1; iteration < data.iterations; ++iteration) {
+            BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
+            SetVectorMask<float>(8);
+            Adds<float, false>(sum, sum, data.eps, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<float>(64);
+            Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
+            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+            Columns(mat);
+            if (data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+                BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
+                SetVectorMask<float>(8);
+                Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+                Abs<float, false>(probe, probe, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+                WholeReduceMax<float, false>(probe[64], probe, MASK_PLACEHOLDER,
+                    1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                Sync<HardEvent::V_S>();
+                const float deviation = probe.GetValue(64);
+                SetVectorMask<float>(64);
+                if (deviation <= kSettledDev) {
+                    break;
+                }
+            }
+        }
+        Gather(compact, mat, table[64], 0, 32);
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            Sync<HardEvent::V_MTE3>();
+            DataCopyPad(yGm, compact, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0});
+        } else {
+            Cast(output, compact, RoundMode::CAST_NONE, 32);
+            Sync<HardEvent::V_MTE3>();
+            DataCopyPad(yGm, output, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0});
+        }
+    }
+};
+
 template <typename DT_X, uint32_t GROUP_ORDER>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
                                         GM_ADDR tiling) {
@@ -508,8 +610,13 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     if constexpr (GROUP_ORDER != 0U) {
         constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
         if (static_cast<uint32_t>(GetBlockIdx()) * groupMatrices + groupMatrices <= tiling_data.matrices) {
-            KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
-            op.Process(logits, weights, tiling, tiling_data);
+            if constexpr (GROUP_ORDER == 4U) {
+                KernelMhcSinkhornNarrowPair<DT_X> op;
+                op.Process(logits, weights, tiling, tiling_data);
+            } else {
+                KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
+                op.Process(logits, weights, tiling, tiling_data);
+            }
             PipeBarrier<PIPE_ALL>();
             return;
         }

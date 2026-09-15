@@ -16,7 +16,6 @@ constexpr uint32_t kSingleMatrixDims = 3;
 constexpr uint32_t kBatchMatrixDims = 4;
 constexpr uint32_t kTileWidth = 8;    // padded tile row width in fp32 lanes
 constexpr uint32_t kSentinelSlot = 60;  // compact slot the padding lanes read (-inf)
-constexpr uint32_t kHeadBlocks = 8;  // block count with the lowest measured head cost
 
 bool SupportedOrder(int64_t order) {
     return order == 4 || order == 6 || order == 8;
@@ -84,16 +83,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         static_cast<int32_t>(tensor_x->GetOriginShape().GetDimNum()) - 1));
     const int32_t aivCores = platform.GetCoreNumAiv();
     const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
-    // A microsecond scale kernel pays for every block it starts, but the head
-    // cost is not monotone in the block count: fewer than an octet of blocks is
-    // both slower on average and bimodal, while the octet is the stable minimum
-    // before the cost climbs again towards the full core count. Small batches
-    // therefore ask for an octet of blocks and let the idle ones return
-    // immediately; larger batches keep one matrix per block up to the core count.
-    const uint32_t headBlocks = std::min<uint32_t>(kHeadBlocks, cores);
+    // Each task holds a complete group of independent matrices.
     const uint32_t groupMatrices = order == 4U ? 2U : 4U;
     const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
-    const uint32_t blockCount = std::min(std::max(tasks, headBlocks), cores);
+    const uint32_t blockCount = std::min(std::max(tasks, 8U), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
@@ -131,19 +124,36 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
     }
 
-    for (uint32_t slot = 0; slot < 128U; ++slot) {
-        const uint32_t batch = slot / 64U;
-        const uint32_t row = (slot % 64U) / 8U;
-        const uint32_t column = slot % 8U;
-        tiling->pairGather[slot] = (row < order && column < order ?
-            batch * order * order + row * order + column : 252U) * sizeof(float);
-    }
-    for (uint32_t slot = 0; slot < 80U; ++slot) {
-        const uint32_t batch = slot / (order * order);
-        const uint32_t row = (slot % (order * order)) / order;
-        const uint32_t column = slot % order;
-        tiling->pairGather[128U + slot] = (slot < 2U * order * order ?
-            batch * 64U + row * 8U + column : 0U) * sizeof(float);
+    if (order == 4U) {
+        for (uint32_t slot = 0; slot < 208U; ++slot) {
+            tiling->pairGather[slot] = 0U;
+        }
+        for (uint32_t slot = 0; slot < 64U; ++slot) {
+            const uint32_t matrix = slot / 32U;
+            const uint32_t row = (slot % 32U) / 8U;
+            const uint32_t column = slot % 8U;
+            tiling->pairGather[slot] = (column < 4U ?
+                matrix * 16U + row * 4U + column : 252U) * sizeof(float);
+        }
+        for (uint32_t slot = 0; slot < 32U; ++slot) {
+            tiling->pairGather[64U + slot] = ((slot / 16U) * 32U +
+                ((slot % 16U) / 4U) * 8U + slot % 4U) * sizeof(float);
+        }
+    } else {
+        for (uint32_t slot = 0; slot < 128U; ++slot) {
+            const uint32_t batch = slot / 64U;
+            const uint32_t row = (slot % 64U) / 8U;
+            const uint32_t column = slot % 8U;
+            tiling->pairGather[slot] = (row < order && column < order ?
+                batch * order * order + row * order + column : 252U) * sizeof(float);
+        }
+        for (uint32_t slot = 0; slot < 80U; ++slot) {
+            const uint32_t batch = slot / (order * order);
+            const uint32_t row = (slot % (order * order)) / order;
+            const uint32_t column = slot % order;
+            tiling->pairGather[128U + slot] = (slot < 2U * order * order ?
+                batch * 64U + row * 8U + column : 0U) * sizeof(float);
+        }
     }
 
     context->SetBlockDim(blockCount);
