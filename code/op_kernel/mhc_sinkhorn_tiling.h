@@ -13,7 +13,7 @@ struct MhcSinkhornTilingData {
     uint32_t iterations;       // Sinkhorn iterations, 1..100
     float eps;                 // normalization guard
     uint32_t dtypeSize;        // input element size in bytes (2 or 4)
-    uint32_t reserved0;
+    float tolerance;           // settled band of the loop exit, see the kernel
     uint32_t reserved1;
     // Byte offsets for the two indexed copies that move a narrow matrix between
     // its compact n*n form and the padded tile: the first 64 entries address one

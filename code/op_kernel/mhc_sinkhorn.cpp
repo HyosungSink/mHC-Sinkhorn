@@ -9,7 +9,6 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
-constexpr float kSettledDev = 1.0e-3F;  // row-sum residual still accepted as settled
 constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction
 constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
 
@@ -60,6 +59,7 @@ public:
         count_ = limit > first_ ? limit - first_ : 0U;
         n_ = tiling_.n;
         iterations_ = tiling_.iterations;
+        tolerance_ = tiling_.tolerance;
     }
 
     __aicore__ inline void Process() {
@@ -285,6 +285,8 @@ private:
         // that is left behind is the column-normalized iterate the schedule would
         // have emitted, and no probe is spent on a tile that cannot be settled.
         const bool contractive = tiling_.eps > kMinContractEps;
+        const float highLimit = 1.0F + tolerance_;
+        const float lowLimit = 1.0F - tolerance_;
         for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
                                          static_cast<int32_t>(kRowLanes));
@@ -314,7 +316,7 @@ private:
                     low = value;
                 }
             }
-            if (high - 1.0F <= kSettledDev && 1.0F - low <= kSettledDev) {
+            if (high <= highLimit && low >= lowLimit) {
                 break;
             }
         }
@@ -331,6 +333,7 @@ private:
     uint32_t count_ = 0;
     uint32_t n_ = 0;
     uint32_t iterations_ = 0;
+    float tolerance_ = 0.0F;
 };
 
 template <typename DT_X>
@@ -350,7 +353,7 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     tiling_data.iterations = raw->iterations;
     tiling_data.eps = raw->eps;
     tiling_data.dtypeSize = raw->dtypeSize;
-    tiling_data.reserved0 = 0U;
+    tiling_data.tolerance = raw->tolerance;
     tiling_data.reserved1 = 0U;
     KernelMhcSinkhorn<DT_X> op;
     op.Init(logits, weights, tiling, tiling_data);

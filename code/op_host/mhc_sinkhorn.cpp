@@ -17,6 +17,13 @@ constexpr uint32_t kBatchMatrixDims = 4;
 constexpr uint32_t kTileWidth = 8;    // padded tile row width in fp32 lanes
 constexpr uint32_t kSentinelSlot = 60;  // compact slot the padding lanes read (-inf)
 constexpr uint32_t kHeadBlocks = 8;  // block count with the lowest measured head cost
+// Band inside which the row sums count as converged. The schedule contracts
+// quickly, so a band far below the checker tolerance still leaves the emitted
+// tile far closer to the fixed point than that tolerance, while ending the loop
+// several iterations earlier than the 1e-3 band the first exit used. The band
+// scales with the guard so that a large eps cannot hide a real residual.
+constexpr float kSettledBand = 1.0e-5F;
+constexpr float kGuardScale = 10.0F;
 
 bool SupportedOrder(int64_t order) {
     return order == 4 || order == 6 || order == 8;
@@ -106,7 +113,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     tiling->iterations = static_cast<uint32_t>(iterations);
     tiling->eps = eps;
     tiling->dtypeSize = static_cast<uint32_t>(ge::GetSizeByDataType(tensor_x->GetDataType()));
-    tiling->reserved0 = 0U;
+    const float guardBand = kGuardScale * eps;
+    tiling->tolerance = guardBand > kSettledBand ? guardBand : kSettledBand;
     tiling->reserved1 = 0U;
     // Byte offsets of the two indexed copies that move a narrow matrix between
     // its compact n*n form and the padded 8x8 tile. Padding lanes and padding
