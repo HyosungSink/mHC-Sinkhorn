@@ -418,6 +418,13 @@ public:
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
         if constexpr (N < 8U) {
+            if constexpr (sizeof(DT_X) == sizeof(float)) {
+                compact.SetValue(252U, kNegHuge);
+            } else {
+                stage.SetValue(252U, static_cast<DT_X>(kNegHuge));
+            }
+        }
+        if constexpr (N < 8U) {
             DataCopyPad(table, tables, DataCopyExtParams{1, 336U * sizeof(uint32_t), 0, 0, 0},
                         DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         }
@@ -432,11 +439,6 @@ public:
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
-            if constexpr (sizeof(DT_X) == sizeof(float)) {
-                compact.SetValue(252U, kNegHuge);
-            } else {
-                stage.SetValue(252U, static_cast<DT_X>(kNegHuge));
-            }
             Sync<HardEvent::S_V>();
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
@@ -547,6 +549,11 @@ public:
         auto table = At<uint32_t>(8192);
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            compact.SetValue(252, kNegHuge);
+        } else {
+            stage.SetValue(252, static_cast<DT_X>(kNegHuge));
+        }
         DataCopyPad(table, tables, DataCopyExtParams{1, 96U * sizeof(uint32_t), 0, 0, 0},
                     DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         if constexpr (sizeof(DT_X) == sizeof(float)) {
@@ -558,11 +565,6 @@ public:
         }
         Duplicate(cons, 1.0F, 8);
         Duplicate(cons, epsValue, 4);
-        if constexpr (sizeof(DT_X) == sizeof(float)) {
-            compact.SetValue(252, kNegHuge);
-        } else {
-            stage.SetValue(252, static_cast<DT_X>(kNegHuge));
-        }
         Sync<HardEvent::S_V>();
         Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) == sizeof(float)) {
