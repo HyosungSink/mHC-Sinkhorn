@@ -85,12 +85,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const int32_t aivCores = platform.GetCoreNumAiv();
     const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
     // A microsecond scale kernel pays for every block it starts, but the head
-    // cost is not monotone in the block count: a single block pair is the most
-    // expensive configuration of all and the measured minimum sits near an
-    // octet of blocks before the cost climbs again towards the full core count.
-    // Small batches therefore ask for an octet of blocks as well and let the
-    // idle ones return immediately; larger batches keep one matrix per block up
-    // to the core count.
+    // cost is not monotone in the block count: fewer than an octet of blocks is
+    // both slower on average and bimodal, while the octet is the stable minimum
+    // before the cost climbs again towards the full core count. Small batches
+    // therefore ask for an octet of blocks and let the idle ones return
+    // immediately; larger batches keep one matrix per block up to the core count.
     const uint32_t headBlocks = std::min<uint32_t>(kHeadBlocks, cores);
     const uint32_t blockCount = std::min(std::max(matrices, headBlocks), cores);
 

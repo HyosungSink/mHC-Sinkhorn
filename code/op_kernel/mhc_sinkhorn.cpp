@@ -258,7 +258,6 @@ private:
         LocalTensor<float> div = At<float>(kOffDiv);
         LocalTensor<float> cons = At<float>(kOffCons);
         LocalTensor<float> col = At<float>(kOffCol);
-        LocalTensor<float> chk = At<float>(kOffSum + 128);
 
         // softmax over the last axis: row maximum, exp, row sum, normalize.
         BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, static_cast<int32_t>(kRowLanes));
@@ -282,31 +281,42 @@ private:
         // The loop stops once the column normalized tile is settled. A doubly
         // stochastic matrix has unit row sums, so the largest row-sum deviation
         // bounds how far the tile still is from the fixed point the documented
-        // schedule converges to. The test runs before the normalization, so what
-        // is left behind is exactly the column-normalized iterate the schedule
-        // would have emitted.
+        // schedule converges to. The test follows the normalization, so the tile
+        // that is left behind is the column-normalized iterate the schedule would
+        // have emitted, and no probe is spent on a tile that cannot be settled.
         const bool contractive = tiling_.eps > kMinContractEps;
         for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
                                          static_cast<int32_t>(kRowLanes));
-            if (contractive) {
-                // The padded rows carry a zero sum and would always fail the
-                // lower test, so the reduction only covers the valid n rows.
-                SetVectorMask<float>(static_cast<int32_t>(n_));
-                WholeReduceMax<float, false>(chk, sum, MASK_PLACEHOLDER, 1, 1, 1, 1);
-                WholeReduceMin<float, false>(chk[kLanes], sum, MASK_PLACEHOLDER, 1, 1, 1, 1);
-                SetVectorMask<float>(static_cast<int32_t>(kLanes));
-                Sync<HardEvent::V_S>();
-                const float high = chk.GetValue(0);
-                const float low = chk[kLanes].GetValue(0);
-                if (high - 1.0F <= kSettledDev && 1.0F - low <= kSettledDev) {
-                    break;
-                }
-            }
             Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             NormalizeColumns(mat, tmpA, tmpB, cons, col);
+            if (!contractive || iteration + 1U >= iterations_) {
+                // Either the eps regime no longer contracts, so the documented
+                // schedule has to run in full, or this was the last permitted
+                // step and there is nothing left to probe.
+                continue;
+            }
+            // The padded rows carry a zero sum and would always fail the lower
+            // test, so only the valid n rows are read back.
+            BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
+                                         static_cast<int32_t>(kRowLanes));
+            Sync<HardEvent::V_S>();
+            float high = sum.GetValue(0);
+            float low = high;
+            for (uint32_t row = 1; row < n_; ++row) {
+                const float value = sum.GetValue(static_cast<int32_t>(row));
+                if (value > high) {
+                    high = value;
+                }
+                if (value < low) {
+                    low = value;
+                }
+            }
+            if (high - 1.0F <= kSettledDev && 1.0F - low <= kSettledDev) {
+                break;
+            }
         }
 
     }
