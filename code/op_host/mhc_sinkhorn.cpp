@@ -86,7 +86,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     // Each task holds a complete group of independent matrices.
     const uint32_t groupMatrices = order == 4U ? 2U : 4U;
     const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
-    const uint32_t blockCount = std::min(std::max(tasks, 8U), cores);
+    const uint32_t blockCount = std::min(std::max(tasks, 16U), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
