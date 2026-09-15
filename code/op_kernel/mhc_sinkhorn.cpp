@@ -597,17 +597,22 @@ public:
     }
 };
 
-template <typename DT_X, uint32_t GROUP_ORDER>
+template <typename DT_X, uint32_t GROUP_ORDER, uint32_t ACTIVE_GROUPS>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
                                         GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
+    if constexpr (GROUP_ORDER != 0U && ACTIVE_GROUPS != 0U) {
+        if (static_cast<uint32_t>(GetBlockIdx()) >= ACTIVE_GROUPS) {
+            return;
+        }
+    }
     // The six fields this kernel needs are read straight from the tiling block
     // as scalars. The structured copy would move the whole block onto the stack
     // first, and at this kernel size that copy alone costs a few hundred
     // nanoseconds, more than the arithmetic it describes.
     __gm__ const MhcSinkhornTilingData *raw =
         reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
-    if constexpr (GROUP_ORDER == 8U) {
+    if constexpr (GROUP_ORDER == 8U && ACTIVE_GROUPS == 0U) {
         constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
         if (static_cast<uint32_t>(GetBlockIdx()) * groupMatrices >= raw->matrices) {
             return;

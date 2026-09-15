@@ -91,7 +91,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
     const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER);
+    const uint32_t ACTIVE_GROUPS = GROUP_ORDER != 0U &&
+        (tasks == 1U || tasks == 2U || tasks == 4U) ? tasks : 0U;
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
     if (tiling == nullptr) {

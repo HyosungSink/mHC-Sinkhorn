@@ -6,12 +6,14 @@
 ASCENDC_TPL_ARGS_DECL(MhcSinkhorn,
     ASCENDC_TPL_DATATYPE_DECL(DT_LOGITS, C_DT_FLOAT16, C_DT_FLOAT),
     ASCENDC_TPL_UINT_DECL(GROUP_ORDER, ASCENDC_TPL_4_BW, ASCENDC_TPL_UI_LIST, 0, 4, 6, 8),
+    ASCENDC_TPL_UINT_DECL(ACTIVE_GROUPS, ASCENDC_TPL_4_BW, ASCENDC_TPL_UI_LIST, 0, 1, 2, 4),
 );
 
 ASCENDC_TPL_SEL(
     ASCENDC_TPL_ARGS_SEL(
         ASCENDC_TPL_DATATYPE_SEL(DT_LOGITS, C_DT_FLOAT16, C_DT_FLOAT),
         ASCENDC_TPL_UINT_SEL(GROUP_ORDER, ASCENDC_TPL_UI_LIST, 0, 4, 6, 8),
+        ASCENDC_TPL_UINT_SEL(ACTIVE_GROUPS, ASCENDC_TPL_UI_LIST, 0, 1, 2, 4),
         // The operator is pure vector work: announcing it keeps the scheduler
         // from starting cube cores that have nothing to run, which is pure head
         // cost at this kernel size.
