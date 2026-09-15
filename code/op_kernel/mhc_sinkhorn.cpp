@@ -92,18 +92,17 @@ private:
         LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
         LocalTensor<float> epsSeed = At<float>(kOffCons + 128);  // scratch low block
         const float eps = tiling_.eps;
-        // cons carries the eight lane pattern eps..eps,1..1 on the low lanes.
-        // The gather offsets are the byte strides 0,4,...,28 repeated per block;
-        // building them from a lane index costs four instructions instead of a
-        // scalar store per lane, which matters at this kernel size.
+        // cons carries the eight lane pattern eps..eps,1..1 on its low lanes and
+        // epsSeed the same pattern with the padding lanes cleared. The third
+        // constant is the gather offset of every lane: the byte strides
+        // 0,4,...,28 repeat once per 32 byte data block, which is exactly the
+        // broadcast the column divisor and epsVec need.
         LocalTensor<int32_t> lanes = At<int32_t>(kOffIndex);
-        LocalTensor<int32_t> laneMod = At<int32_t>(kOffDiv);  // scratch, reused later
         for (uint32_t lane = 0; lane < kRowLanes; ++lane) {
             const bool inside = lane < n_;
             cons.SetValue(lane, inside ? eps : 1.0F);
             epsSeed.SetValue(lane, inside ? eps : 0.0F);
         }
-        (void)laneMod;
         for (uint32_t lane = 0; lane < kLanes; ++lane) {
             lanes.SetValue(lane, static_cast<int32_t>((lane % kRowLanes) * sizeof(float)));
         }
@@ -270,10 +269,11 @@ private:
         // The loop stops on a bounded error argument rather than on a fixed
         // iteration count. One finished iteration moves every lane by at most
         // `move`; if the two most recent iterations shrank by the observed
-        // factor rho, the iterations still to come add at most
-        // move*rho/(1-rho). Leaving once that tail is within kSettledTail keeps
-        // the emitted tile within kSettledTail of every later iterate, including
-        // the one the documented schedule would have produced. That argument needs
+        // factor rho, the iterations still to come add at most move*shrink with
+        // shrink = rho/(1-rho), never counted as less than kTailFloor of the last
+        // step. Leaving once that tail is within kSettledTail keeps the emitted
+        // tile within kSettledTail of every later iterate, including the one the
+        // documented schedule would have produced. That argument needs
         // the normalization to stay contractive, so an eps small enough for
         // normalized entries to underflow keeps the exact requested schedule.
         const bool contractive = tiling_.eps > kMinContractEps;
