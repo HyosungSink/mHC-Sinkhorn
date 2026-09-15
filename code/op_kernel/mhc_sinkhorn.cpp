@@ -49,7 +49,7 @@ __aicore__ inline bool RowsSettled(const LocalTensor<float> &sum,
         CMPMODE::GE, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
     CompareScalar<float, uint8_t, false>(flags[32], sum, 1.0F - kSettledDev,
         CMPMODE::LT, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-    // The compiler synchronizes GetValue with the vector comparison results.
+    Sync<HardEvent::V_S>();
     auto words = scratch.ReinterpretCast<uint32_t>();
     constexpr uint32_t valid = static_cast<uint32_t>((1ULL << Rows) - 1ULL);
     return ((words.GetValue(0) | words.GetValue(8)) & valid) == 0U;
@@ -433,6 +433,7 @@ public:
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
             compact.SetValue(252U, kNegHuge);
+            Sync<HardEvent::S_V>();
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
             Duplicate(eps, epsValue, 64U * kBatch);
@@ -517,11 +518,9 @@ public:
                                     uint32_t iterations, float epsValue) {
         GlobalTensor<DT_X> xGm;
         GlobalTensor<DT_X> yGm;
-        GlobalTensor<uint32_t> tables;
         const uint64_t first = static_cast<uint64_t>(GetBlockIdx()) * 2U;
         xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x) + first * 16U);
         yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y) + first * 16U);
-        tables.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling) + kTilingWords + kGatherWords);
         auto mat = At<float>(0);
         auto sum = At<float>(3072);
         auto div = At<float>(4096);
@@ -531,8 +530,6 @@ public:
         auto table = At<uint32_t>(8192);
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
-        DataCopyPad(table, tables, DataCopyExtParams{1, 96U * sizeof(uint32_t), 0, 0, 0},
-                    DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             DataCopyPad(compact, xGm, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0},
                         DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
@@ -542,12 +539,27 @@ public:
         }
         Duplicate(cons, 1.0F, 8);
         Duplicate(cons, epsValue, 4);
-        compact.SetValue(252, kNegHuge);
+        auto offsets = At<int32_t>(8192);
+        auto pattern = At<uint32_t>(8448);
+        Duplicate(offsets, static_cast<int32_t>(0), 64);
+        SetVectorMask<int32_t>(0ULL, 0xAAAAAAAAAAAAAAAAULL);
+        Adds<int32_t, false>(offsets, offsets, 4, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        SetVectorMask<int32_t>(0ULL, 0xCCCCCCCCCCCCCCCCULL);
+        Adds<int32_t, false>(offsets, offsets, 8, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        SetVectorMask<int32_t>(0ULL, 0xFF00FF00FF00FF00ULL);
+        Adds<int32_t, false>(offsets, offsets, 16, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        SetVectorMask<int32_t>(0ULL, 0xFFFF0000FFFF0000ULL);
+        Adds<int32_t, false>(offsets, offsets, 32, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        SetVectorMask<int32_t>(0ULL, 0xFFFFFFFF00000000ULL);
+        Adds<int32_t, false>(offsets, offsets, 64, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        Duplicate(pattern, 0x0F0F0F0FU, 8);
+        Duplicate(mat, kNegHuge, 64);
         Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) != sizeof(float)) {
             Cast(compact, stage, RoundMode::CAST_NONE, 32);
         }
-        Gather(mat, compact, table, 0, 64);
+        uint64_t validRows[2] = {0x0F0F0F0F0F0F0F0FULL, 0ULL};
+        Gather(mat, compact, table, 0, validRows, 1, 8);
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
         Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
@@ -575,7 +587,8 @@ public:
                 }
             }
         }
-        Gather(compact, mat, table[64], 0, 32);
+        uint64_t selected = 0;
+        GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm, compact, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0});
