@@ -234,9 +234,9 @@ private:
         // the division below run under an eight lane mask, one repeat per row.
         SetVectorMask<float>(static_cast<int32_t>(kRowLanes));
         Add<float, false>(col, col, cons, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 1, 1, 1));
-        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER,
-                          static_cast<uint8_t>(kRowLanes), BinaryRepeatParams(1, 1, 1, 1, 1, 0));
         SetVectorMask<float>(static_cast<int32_t>(kLanes));
+        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER,
+                          1, BinaryRepeatParams(1, 1, 0, 8, 8, 8));
     }
 
     __aicore__ inline void RowStep(const LocalTensor<float> &mat,
@@ -366,8 +366,7 @@ class KernelMhcSinkhornPair {
         SetVectorMask<float>(8);
         Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 0});
         SetVectorMask<float>(64);
-        Adds<float, false>(div, col, 0.0F, MASK_PLACEHOLDER, kBatch, {1, 0, 8, 8});
-        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
+        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 8});
     }
 public:
     __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
@@ -491,6 +490,12 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     // nanoseconds, more than the arithmetic it describes.
     __gm__ const MhcSinkhornTilingData *raw =
         reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
+    if constexpr (GROUP_ORDER == 8U) {
+        constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
+        if (static_cast<uint32_t>(GetBlockIdx()) * groupMatrices >= raw->matrices) {
+            return;
+        }
+    }
     MhcSinkhornTilingData tiling_data;
     tiling_data.matrices = raw->matrices;
     tiling_data.matricesPerCore = raw->matricesPerCore;
