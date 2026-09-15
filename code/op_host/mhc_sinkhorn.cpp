@@ -93,10 +93,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
     const uint32_t ACTIVE_GROUPS = GROUP_ORDER != 0U && matrices % groupMatrices == 0U &&
         (tasks == 1U || tasks == 2U || tasks == 4U) ? tasks : 0U;
-    const uint32_t STATIC_ITERATIONS = ACTIVE_GROUPS != 0U && eps == 1.0e-6F &&
-        (iterations == 20 || iterations == 30 || iterations == 50 || iterations == 100) ?
-        static_cast<uint32_t>(iterations) : 0U;
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS, STATIC_ITERATIONS);
+    const bool DEFAULT_EPS = ACTIVE_GROUPS != 0U && eps == 1.0e-6F;
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS, DEFAULT_EPS);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
     if (tiling == nullptr) {
@@ -129,8 +127,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
     }
 
-    uint32_t payloadBytes = STATIC_ITERATIONS != 0U && order != 6U ? 0U :
-        (ACTIVE_GROUPS != 0U ? 2U * sizeof(uint32_t) : kTilingWords * sizeof(uint32_t));
+    uint32_t payloadBytes = ACTIVE_GROUPS != 0U ?
+        2U * sizeof(uint32_t) : kTilingWords * sizeof(uint32_t);
     if (ACTIVE_GROUPS == 0U && order < 8U) {
         payloadBytes = (kTilingWords + kGatherWords) * sizeof(uint32_t);
     }

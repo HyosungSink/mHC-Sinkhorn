@@ -632,7 +632,7 @@ public:
     }
 };
 
-template <typename DT_X, uint32_t GROUP_ORDER, uint32_t ACTIVE_GROUPS, uint32_t STATIC_ITERATIONS>
+template <typename DT_X, uint32_t GROUP_ORDER, uint32_t ACTIVE_GROUPS, bool DEFAULT_EPS>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
                                         GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
@@ -643,8 +643,8 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
         // Static groups contain no partial matrix group; the Host checks this.
         __gm__ const MhcSinkhornTilingData *groupData =
             reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
-        const uint32_t iterations = STATIC_ITERATIONS != 0U ? STATIC_ITERATIONS : groupData->iterations;
-        const float epsValue = STATIC_ITERATIONS != 0U ? 1.0e-6F : groupData->eps;
+        const uint32_t iterations = groupData->iterations;
+        const float epsValue = DEFAULT_EPS ? 1.0e-6F : groupData->eps;
         if constexpr (GROUP_ORDER == 4U) {
             KernelMhcSinkhornNarrowPair<DT_X> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
