@@ -170,6 +170,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         }
     }
 
+    uint32_t payloadBytes = kTilingWords * sizeof(uint32_t);
+    if (GROUP_ORDER == 6U) {
+        payloadBytes = (kTilingWords + kGatherWords + 192U) * sizeof(uint32_t);
+    } else if (order < 8U && ACTIVE_GROUPS == 0U) {
+        payloadBytes = (kTilingWords + kGatherWords) * sizeof(uint32_t);
+    }
+    if (ACTIVE_GROUPS != 0U && order != 6U) {
+        payloadBytes = 2U * sizeof(uint32_t);
+    }
+    context->GetRawTilingData()->SetDataSize(payloadBytes);
     context->SetBlockDim(blockCount);
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     if (currentWorkspace != nullptr) {
