@@ -292,7 +292,7 @@ private:
             Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             NormalizeColumns(mat, tmpA, tmpB, cons, col);
-            if (!contractive || iteration + 1U >= iterations_) {
+            if (iteration < 2U || !contractive || iteration + 1U >= iterations_) {
                 // Either the eps regime no longer contracts, so the documented
                 // schedule has to run in full, or this was the last permitted
                 // step and there is nothing left to probe.
@@ -448,7 +448,7 @@ public:
             Brcb(div, sum, kBatch, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
             Columns(mat);
-            if (data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+            if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
                 BlockReduceSum<float, false>(sum, mat, kBatch, MASK_PLACEHOLDER, 1, 1, 8);
                 SetVectorMask<float>(0, ((1ULL << N) - 1ULL) * (kBatch == 2U ? 0x101ULL : 0x1010101ULL));
                 Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
@@ -555,7 +555,7 @@ public:
             Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             Columns(mat);
-            if (data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+            if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
                 SetVectorMask<float>(8);
                 Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
