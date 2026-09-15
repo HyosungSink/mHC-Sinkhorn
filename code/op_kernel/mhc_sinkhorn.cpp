@@ -102,11 +102,15 @@ private:
             const bool inside = lane < n_;
             cons.SetValue(lane, inside ? eps : 1.0F);
             epsSeed.SetValue(lane, inside ? eps : 0.0F);
-        }
-        for (uint32_t lane = 0; lane < kLanes; ++lane) {
-            lanes.SetValue(lane, static_cast<int32_t>((lane % kRowLanes) * sizeof(float)));
+            lanes.SetValue(lane, static_cast<int32_t>(lane * sizeof(float)));
         }
         Sync<HardEvent::S_V>();
+        // The offset pattern repeats in every data block, so only its first
+        // block is written scalar by scalar; the rest is filled by vector copies
+        // of that block.
+        for (uint32_t block = 1; block < kRowLanes; ++block) {
+            Adds(lanes[block * kRowLanes], lanes, 0, static_cast<int32_t>(kRowLanes));
+        }
         Gather(epsVec, epsSeed, index, 0, static_cast<uint32_t>(kLanes));
         SetVectorMask<float>(static_cast<int32_t>(kLanes));
     }
