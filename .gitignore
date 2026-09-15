@@ -23,3 +23,6 @@ logs/
 
 # Local test reports and investigation archives
 /reports/
+
+# Local experiment records (never part of a submission)
+optimization/

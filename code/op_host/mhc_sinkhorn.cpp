@@ -2,77 +2,158 @@
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
+#include <algorithm>
+
 #include "../op_kernel/mhc_sinkhorn_tiling.h"
 #include "../op_kernel/tiling_key_mhc_sinkhorn.h"
 
 namespace optiling {
-    static ge::graphStatus TilingFunc(gert::TilingContext *context) {
-        // 示例: 获取平台信息
-        auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-        int32_t num_cores_aiv = platform.GetCoreNumAiv();
-        uint64_t ub_size;
-        platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_size);
-        // 示例: 获取算子输入数组信息
-        const gert::Tensor *tensor_logits = context->GetRequiredInputTensor(0);
-        const gert::Tensor *tensor_mask = context->GetOptionalInputTensor(1);
-        if(tensor_mask) {
-            // 可选输入数组存在
-        }
-        ge::DataType dtype_logits = tensor_logits->GetDataType(); // 获取数据类型
-        int dtype_size_logits = ge::GetSizeByDataType(dtype_logits); // 获取数据类型的字长
-        uint32_t length_logits = tensor_logits->GetShapeSize(); // 获取元素个数
-        uint32_t size_logits = tensor_logits->GetSize(); // 获取内存大小
-        // 示例: 获取算子输入属性
-        const gert::RuntimeAttrs *attrs = context->GetAttrs();
-        const int64_t *attr_iterations = attrs->GetInt(0);
-        const float *attr_eps = attrs->GetFloat(1);
-        // 示例: 配置tiling key, 从而实现kernel侧不同数据类型/算法的区分
-        uint32_t DT_LOGITS = static_cast<uint32_t>(dtype_logits);
-        ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS);
-        // 示例: 计算tiling方案并填充tiling结构体
-        MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
-        tiling->length = length_logits;
-        // 配置启动核数
-        context->SetBlockDim(num_cores_aiv);
-        // 配置workspace大小
-        size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-        currentWorkspace[0] = 0;
-        return ge::GRAPH_SUCCESS;
+namespace {
+constexpr uint32_t kMinOrder = 4;
+constexpr uint32_t kMaxOrder = 8;
+constexpr uint32_t kMaxIterations = 100;
+constexpr uint32_t kSingleMatrixDims = 3;
+constexpr uint32_t kBatchMatrixDims = 4;
+
+bool SupportedOrder(int64_t order) {
+    return order == 4 || order == 6 || order == 8;
+}
+
+bool SupportedDtype(ge::DataType dtype) {
+    return dtype == ge::DT_FLOAT || dtype == ge::DT_FLOAT16;
+}
+
+// Number of independent n x n matrices in the leading dimensions.
+bool MatrixCount(const gert::Shape &shape, uint32_t &matrices) {
+    const size_t dims = shape.GetDimNum();
+    if (dims != kSingleMatrixDims && dims != kBatchMatrixDims) {
+        return false;
     }
+    const int64_t order = shape.GetDim(static_cast<int32_t>(dims) - 1);
+    if (!SupportedOrder(order) || shape.GetDim(static_cast<int32_t>(dims) - 2) != order) {
+        return false;
+    }
+    uint64_t total = 1;
+    for (size_t axis = 0; axis + 2 < dims; ++axis) {
+        const int64_t dim = shape.GetDim(static_cast<int32_t>(axis));
+        if (dim <= 0) {
+            return false;
+        }
+        total *= static_cast<uint64_t>(dim);
+        if (total > 0x3FFFFFFFULL) {
+            return false;
+        }
+    }
+    matrices = static_cast<uint32_t>(total);
+    return true;
+}
+}  // namespace
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    if (context == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const gert::Tensor *tensor_x = context->GetRequiredInputTensor(0);
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    if (tensor_x == nullptr || attrs == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    if (!SupportedDtype(tensor_x->GetDataType())) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t matrices = 0;
+    if (!MatrixCount(tensor_x->GetOriginShape(), matrices)) {
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t *attr_iterations = attrs->GetInt(0);
+    const float *attr_eps = attrs->GetFloat(1);
+    const int64_t iterations = attr_iterations == nullptr ? 20 : *attr_iterations;
+    const float eps = attr_eps == nullptr ? 1.0e-6F : *attr_eps;
+    if (iterations < 1 || iterations > static_cast<int64_t>(kMaxIterations)) {
+        return ge::GRAPH_FAILED;
+    }
+    if (!(eps >= -1.0e38F && eps <= 1.0e38F)) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    const uint32_t order = static_cast<uint32_t>(tensor_x->GetOriginShape().GetDim(
+        static_cast<int32_t>(tensor_x->GetOriginShape().GetDimNum()) - 1));
+    const int32_t aivCores = platform.GetCoreNumAiv();
+    const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
+    const uint32_t blockCount = std::min(matrices, cores);
+
+    const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS);
+
+    MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
+    if (tiling == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    tiling->matrices = matrices;
+    tiling->matricesPerCore = (matrices + blockCount - 1U) / blockCount;
+    tiling->n = order;
+    tiling->iterations = static_cast<uint32_t>(iterations);
+    tiling->eps = eps;
+    tiling->dtypeSize = static_cast<uint32_t>(ge::GetSizeByDataType(tensor_x->GetDataType()));
+    tiling->reserved0 = 0U;
+    tiling->reserved1 = 0U;
+
+    context->SetBlockDim(blockCount);
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    if (currentWorkspace != nullptr) {
+        currentWorkspace[0] = 0;
+    }
+    return ge::GRAPH_SUCCESS;
+}
 }  // namespace optiling
 
 namespace ge {
-    static graphStatus InferShape(gert::InferShapeContext *context) {
-        return GRAPH_SUCCESS;
+static graphStatus InferShape(gert::InferShapeContext *context) {
+    if (context == nullptr) {
+        return GRAPH_FAILED;
     }
-    static graphStatus InferDataType(gert::InferDataTypeContext *context) {
-        return ge::GRAPH_SUCCESS;
+    const gert::Shape *xShape = context->GetInputShape(0);
+    gert::Shape *outShape = context->GetOutputShape(0);
+    if (xShape == nullptr || outShape == nullptr) {
+        return GRAPH_FAILED;
     }
+    *outShape = *xShape;
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    if (context == nullptr) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, context->GetInputDataType(0));
+    return GRAPH_SUCCESS;
+}
 }  // namespace ge
 
 namespace ops {
-    class MhcSinkhorn : public OpDef {
-    public:
-        explicit MhcSinkhorn(const char *name) : OpDef(name) {
-            this->Input("logits")
-                .ParamType(REQUIRED)
-                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Input("mask")
-                .ParamType(OPTIONAL)
-                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Output("weights")
-                .ParamType(REQUIRED)
-                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-                .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-            this->Attr("iterations").AttrType(OPTIONAL).Int(20);
-            this->Attr("eps").AttrType(OPTIONAL).Float(1e-06);
-            this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-            this->AICore()
-                .SetTiling(optiling::TilingFunc)
-                .AddConfig("ascend910b");
-        }
-    };
-    OP_ADD(MhcSinkhorn);
+class MhcSinkhorn : public OpDef {
+public:
+    explicit MhcSinkhorn(const char *name) : OpDef(name) {
+        this->Input("logits")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("weights")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Attr("iterations").AttrType(OPTIONAL).Int(20);
+        this->Attr("eps").AttrType(OPTIONAL).Float(1e-06);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+OP_ADD(MhcSinkhorn);
 }  // namespace ops

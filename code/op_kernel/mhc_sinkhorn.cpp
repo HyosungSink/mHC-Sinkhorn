@@ -4,25 +4,237 @@
 #include "mhc_sinkhorn_tiling.h"
 #include "tiling_key_mhc_sinkhorn.h"
 
-template <class DT_LOGITS>
+using namespace AscendC;
+
+namespace {
+constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
+constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
+constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
+
+// UB arena layout in bytes. Every matrix lives in a padded 8x8 fp32 tile whose
+// rows are separated by one 32B data block, so block level reductions act on
+// rows and block sized address offsets act on columns.
+constexpr uint32_t kOffMat = 0;       // padded matrix (512B: 256B payload + tree slack)
+constexpr uint32_t kOffTmpA = 512;    // column tree level 1 (512B)
+constexpr uint32_t kOffTmpB = 1024;   // column tree level 2 (512B)
+constexpr uint32_t kOffSum = 1536;    // reduction result (256B)
+constexpr uint32_t kOffDiv = 1664;    // broadcast divisor (256B)
+constexpr uint32_t kOffCons = 1920;   // divisor constant, eps / 1.0 (256B)
+constexpr uint32_t kOffEps = 2176;    // additive eps vector (256B)
+constexpr uint32_t kOffIndex = 2432;  // gather byte offsets, uint32 x 64 (256B)
+constexpr uint32_t kOffStage = 2688;  // input staging (256B)
+constexpr uint32_t kOffOut = 2944;    // output staging (256B)
+constexpr uint32_t kArenaBytes = 3200;
+
+template <AscendC::HardEvent event>
+__aicore__ inline void Sync() {
+    AscendC::SetFlag<event>(EVENT_ID0);
+    AscendC::WaitFlag<event>(EVENT_ID0);
+}
+}  // namespace
+
+template <typename DT_X>
 class KernelMhcSinkhorn {
 public:
     __aicore__ inline KernelMhcSinkhorn() {}
-    __aicore__ inline void Init(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, uint32_t length) {
 
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, const MhcSinkhornTilingData &data) {
+        tiling_ = data;
+        xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x));
+        yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y));
+        pipe_.InitBuffer(arena_, kArenaBytes);
+        const uint32_t blockIdx = static_cast<uint32_t>(GetBlockIdx());
+        const uint32_t begin = blockIdx * tiling_.matricesPerCore;
+        const uint32_t end = begin + tiling_.matricesPerCore;
+        first_ = begin < tiling_.matrices ? begin : tiling_.matrices;
+        const uint32_t limit = end < tiling_.matrices ? end : tiling_.matrices;
+        count_ = limit > first_ ? limit - first_ : 0U;
+        n_ = tiling_.n;
+        iterations_ = tiling_.iterations;
     }
+
     __aicore__ inline void Process() {
-
+        if (count_ == 0U) {
+            return;
+        }
+        BuildConstants();
+        for (uint32_t index = 0; index < count_; ++index) {
+            ProcessMatrix(first_ + index);
+        }
     }
-private:
 
+private:
+    template <typename U>
+    __aicore__ inline LocalTensor<U> At(uint32_t byteOffset) {
+        return arena_.Get<U>()[byteOffset / sizeof(U)];
+    }
+
+    // Lanes below n carry eps, the remaining lanes carry 1.0 so that the divide
+    // keeps padding lanes at zero even when eps is zero. epsVec is the same
+    // pattern with padding lanes cleared, used for the initial softmax shift.
+    __aicore__ inline void BuildConstants() {
+        LocalTensor<float> cons = At<float>(kOffCons);
+        LocalTensor<float> epsVec = At<float>(kOffEps);
+        LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
+        const float eps = tiling_.eps;
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+            const uint32_t column = lane % kRowLanes;
+            const bool inside = column < n_;
+            cons.SetValue(lane, inside ? eps : 1.0F);
+            epsVec.SetValue(lane, inside ? eps : 0.0F);
+            index.SetValue(lane, column * static_cast<uint32_t>(sizeof(float)));
+        }
+        Sync<HardEvent::S_V>();
+    }
+
+    __aicore__ inline void LoadMatrix(uint32_t matrix) {
+        LocalTensor<float> mat = At<float>(kOffMat);
+        const uint64_t offset = static_cast<uint64_t>(matrix) * n_ * n_;
+        // The previous store reads the tile and the previous compute reads the
+        // staging buffers, so both must retire before this load overwrites them.
+        Sync<HardEvent::MTE3_MTE2>();
+        Sync<HardEvent::V_MTE2>();
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            DataCopyExtParams copy{static_cast<uint16_t>(n_),
+                                   static_cast<uint32_t>(n_ * sizeof(float)), 0, 0, 0};
+            DataCopyPadExtParams<float> pad{true, 0, static_cast<uint8_t>(kRowLanes - n_), kNegHuge};
+            DataCopyPad(mat, xGm_[offset], copy, pad);
+            Sync<HardEvent::MTE2_V>();
+        } else {
+            LocalTensor<DT_X> stage = At<DT_X>(kOffStage);
+            DataCopyExtParams copy{static_cast<uint16_t>(n_),
+                                   static_cast<uint32_t>(n_ * sizeof(DT_X)), 0, 0, 0};
+            DataCopyPadExtParams<DT_X> pad{true, 0, static_cast<uint8_t>(kRowLanes - n_),
+                                           static_cast<DT_X>(0)};
+            DataCopyPad(stage, xGm_[offset], copy, pad);
+            Duplicate(mat, kNegHuge, static_cast<int32_t>(kLanes));
+            Sync<HardEvent::MTE2_V>();
+            for (uint32_t row = 0; row < n_; ++row) {
+                Cast(mat[row * kRowLanes], stage[row * kRowLanes * 2], RoundMode::CAST_NONE,
+                     static_cast<int32_t>(n_));
+                PipeBarrier<PIPE_V>();
+            }
+            Sync<HardEvent::V_MTE2>();
+        }
+    }
+
+    __aicore__ inline void StoreMatrix(uint32_t matrix) {
+        LocalTensor<float> mat = At<float>(kOffMat);
+        const uint64_t offset = static_cast<uint64_t>(matrix) * n_ * n_;
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            DataCopyExtParams copy{static_cast<uint16_t>(n_),
+                                   static_cast<uint32_t>(n_ * sizeof(float)), 0, 0, 0};
+            Sync<HardEvent::V_MTE3>();
+            DataCopyPad(yGm_[offset], mat, copy);
+        } else {
+            LocalTensor<DT_X> stage = At<DT_X>(kOffOut);
+            Sync<HardEvent::MTE3_V>();
+            for (uint32_t row = 0; row < n_; ++row) {
+                Cast(stage[row * kRowLanes * 2], mat[row * kRowLanes], RoundMode::CAST_NONE,
+                     static_cast<int32_t>(n_));
+                PipeBarrier<PIPE_V>();
+            }
+            Sync<HardEvent::V_MTE3>();
+            DataCopyExtParams copy{static_cast<uint16_t>(n_),
+                                   static_cast<uint32_t>(n_ * sizeof(DT_X)), 0, 0, 0};
+            DataCopyPad(yGm_[offset], stage, copy);
+        }
+    }
+
+    __aicore__ inline void NormalizeColumns(const LocalTensor<float> &mat,
+                                            const LocalTensor<float> &tmpA,
+                                            const LocalTensor<float> &tmpB,
+                                            const LocalTensor<float> &sum,
+                                            const LocalTensor<float> &div,
+                                            const LocalTensor<float> &cons) {
+        LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
+        Add(tmpA, mat, mat[kRowLanes], static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        Add(tmpB, tmpA, tmpA[2 * kRowLanes], static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        Add(sum, tmpB, tmpB[4 * kRowLanes], static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        Add(sum, sum, cons, static_cast<int32_t>(kRowLanes));
+        PipeBarrier<PIPE_V>();
+        Gather(div, sum, index, 0, static_cast<uint32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        Div(mat, mat, div, static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void ProcessMatrix(uint32_t matrix) {
+        LocalTensor<float> mat = At<float>(kOffMat);
+        LocalTensor<float> tmpA = At<float>(kOffTmpA);
+        LocalTensor<float> tmpB = At<float>(kOffTmpB);
+        LocalTensor<float> sum = At<float>(kOffSum);
+        LocalTensor<float> div = At<float>(kOffDiv);
+        LocalTensor<float> cons = At<float>(kOffCons);
+
+        LoadMatrix(matrix);
+
+        // softmax over the last axis: row maximum, exp, row sum, normalize.
+        BlockReduceMax(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1, static_cast<int32_t>(kRowLanes));
+        PipeBarrier<PIPE_V>();
+        Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
+        PipeBarrier<PIPE_V>();
+        Sub(mat, mat, div, static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        Exp(mat, mat, static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        BlockReduceSum(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1, static_cast<int32_t>(kRowLanes));
+        PipeBarrier<PIPE_V>();
+        Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
+        PipeBarrier<PIPE_V>();
+        Div(mat, mat, div, static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+
+        // p = softmax(x) + eps on the valid lanes; padded rows are dropped.
+        Add(mat, mat, At<float>(kOffEps), static_cast<int32_t>(kLanes));
+        PipeBarrier<PIPE_V>();
+        if (n_ < kRowLanes) {
+            Duplicate(mat[n_ * kRowLanes], 0.0F,
+                      static_cast<int32_t>((kRowLanes - n_) * kRowLanes));
+            PipeBarrier<PIPE_V>();
+        }
+
+        // First column normalization: sum over dim -2 plus eps.
+        NormalizeColumns(mat, tmpA, tmpB, sum, div, cons);
+
+        for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
+            // Row normalization: sum over dim -1 plus eps.
+            BlockReduceSum(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1,
+                           static_cast<int32_t>(kRowLanes));
+            PipeBarrier<PIPE_V>();
+            Add(sum, sum, cons, static_cast<int32_t>(kRowLanes));
+            PipeBarrier<PIPE_V>();
+            Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
+            PipeBarrier<PIPE_V>();
+            Div(mat, mat, div, static_cast<int32_t>(kLanes));
+            PipeBarrier<PIPE_V>();
+            NormalizeColumns(mat, tmpA, tmpB, sum, div, cons);
+        }
+
+        StoreMatrix(matrix);
+    }
+
+    TPipe pipe_;
+    TBuf<TPosition::VECCALC> arena_;
+    GlobalTensor<DT_X> xGm_;
+    GlobalTensor<DT_X> yGm_;
+    GM_ADDR yRaw_ = nullptr;
+    MhcSinkhornTilingData tiling_{};
+    uint32_t first_ = 0;
+    uint32_t count_ = 0;
+    uint32_t n_ = 0;
+    uint32_t iterations_ = 0;
 };
 
-template <typename DT_LOGITS>
- __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace, GM_ADDR tiling) {
+template <typename DT_X>
+__global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
+                                        GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
     GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
-    KernelMhcSinkhorn<DT_LOGITS> op;
-    op.Init(logits, mask, weights, tiling_data.length);
+    KernelMhcSinkhorn<DT_X> op;
+    op.Init(logits, weights, tiling_data);
     op.Process();
 }
