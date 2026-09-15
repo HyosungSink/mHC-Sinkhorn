@@ -93,7 +93,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
     const uint32_t ACTIVE_GROUPS = GROUP_ORDER != 0U && matrices % groupMatrices == 0U &&
         (tasks == 1U || tasks == 2U || tasks == 4U) ? tasks : 0U;
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS);
+    const uint32_t STATIC_ITERATIONS = ACTIVE_GROUPS != 0U && eps == 1.0e-6F &&
+        (iterations == 20 || iterations == 30 || iterations == 50 || iterations == 100) ?
+        static_cast<uint32_t>(iterations) : 0U;
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS, STATIC_ITERATIONS);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
     if (tiling == nullptr) {
