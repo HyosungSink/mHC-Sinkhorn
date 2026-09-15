@@ -9,6 +9,7 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
+constexpr uint32_t kProbeEvery = 4;   // iteration stride of the fixed-point probe
 constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
 
 // UB arena layout in bytes. Every matrix lives in a padded 8x8 fp32 tile whose
@@ -24,7 +25,9 @@ constexpr uint32_t kOffEps = 2176;    // additive eps vector (256B)
 constexpr uint32_t kOffIndex = 2432;  // gather byte offsets, uint32 x 64 (256B)
 constexpr uint32_t kOffStage = 2688;  // input staging (256B)
 constexpr uint32_t kOffOut = 2944;    // output staging (256B)
-constexpr uint32_t kArenaBytes = 3200;
+constexpr uint32_t kOffCol = 3200;    // column divisor slot (256B)
+constexpr uint32_t kOffPrev = 3456;   // previous-iteration tile snapshot (256B)
+constexpr uint32_t kArenaBytes = 3712;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync() {
@@ -58,6 +61,9 @@ public:
             return;
         }
         BuildConstants();
+        // One continuous mask for the whole run: every hot-path vector op takes
+        // this mask instead of programming its own.
+        SetVectorMask<float>(static_cast<int32_t>(kLanes));
         for (uint32_t index = 0; index < count_; ++index) {
             ProcessMatrix(first_ + index);
         }
@@ -87,6 +93,10 @@ private:
         Sync<HardEvent::S_V>();
     }
 
+    __aicore__ inline BinaryRepeatParams BinParams() const {
+        return BinaryRepeatParams(1, 1, 1, 8, 8, 8);
+    }
+
     __aicore__ inline void LoadMatrix(uint32_t matrix) {
         LocalTensor<float> mat = At<float>(kOffMat);
         const uint64_t offset = static_cast<uint64_t>(matrix) * n_ * n_;
@@ -112,8 +122,7 @@ private:
             for (uint32_t row = 0; row < n_; ++row) {
                 Cast(mat[row * kRowLanes], stage[row * kRowLanes * 2], RoundMode::CAST_NONE,
                      static_cast<int32_t>(n_));
-                PipeBarrier<PIPE_V>();
-            }
+                    }
             Sync<HardEvent::V_MTE2>();
         }
     }
@@ -132,8 +141,7 @@ private:
             for (uint32_t row = 0; row < n_; ++row) {
                 Cast(stage[row * kRowLanes * 2], mat[row * kRowLanes], RoundMode::CAST_NONE,
                      static_cast<int32_t>(n_));
-                PipeBarrier<PIPE_V>();
-            }
+                    }
             Sync<HardEvent::V_MTE3>();
             DataCopyExtParams copy{static_cast<uint16_t>(n_),
                                    static_cast<uint32_t>(n_ * sizeof(DT_X)), 0, 0, 0};
@@ -146,20 +154,31 @@ private:
                                             const LocalTensor<float> &tmpB,
                                             const LocalTensor<float> &sum,
                                             const LocalTensor<float> &div,
-                                            const LocalTensor<float> &cons) {
+                                            const LocalTensor<float> &cons,
+                                            const LocalTensor<float> &col) {
         LocalTensor<uint32_t> index = At<uint32_t>(kOffIndex);
-        Add(tmpA, mat, mat[kRowLanes], static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        Add(tmpB, tmpA, tmpA[2 * kRowLanes], static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        Add(sum, tmpB, tmpB[4 * kRowLanes], static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        Add(sum, sum, cons, static_cast<int32_t>(kRowLanes));
-        PipeBarrier<PIPE_V>();
-        Gather(div, sum, index, 0, static_cast<uint32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        Div(mat, mat, div, static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
+        Add<float, false>(tmpA, mat, mat[kRowLanes], MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        Add<float, false>(tmpB, tmpA, tmpA[2 * kRowLanes], MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        Add<float, false>(col, tmpB, tmpB[4 * kRowLanes], MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        Add<float, false>(col, col, cons, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        Gather(div, col, index, 0, static_cast<uint64_t>(kLanes), 1, static_cast<uint16_t>(kRowLanes));
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+    }
+
+    // The tile is reproducible bit for bit, so every later iteration is an
+    // identity and the loop can stop.
+    __aicore__ inline bool TileSettled(const LocalTensor<float> &mat,
+                                       const LocalTensor<float> &prev,
+                                       const LocalTensor<float> &scratch,
+                                       const LocalTensor<float> &chk) {
+        Sub(scratch, mat, prev, static_cast<int32_t>(kLanes));
+        Abs(scratch, scratch, static_cast<int32_t>(kLanes));
+        BlockReduceMax<float, false>(chk, scratch, 1, MASK_PLACEHOLDER, 1, 1,
+                                     static_cast<int32_t>(kRowLanes));
+        Sync<HardEvent::V_S>();
+        const bool settled = chk.GetValue(0) == 0.0F;
+        SetVectorMask<float>(static_cast<int32_t>(kLanes));
+        return settled;
     }
 
     __aicore__ inline void ProcessMatrix(uint32_t matrix) {
@@ -169,49 +188,43 @@ private:
         LocalTensor<float> sum = At<float>(kOffSum);
         LocalTensor<float> div = At<float>(kOffDiv);
         LocalTensor<float> cons = At<float>(kOffCons);
+        LocalTensor<float> col = At<float>(kOffCol);
+        LocalTensor<float> prev = At<float>(kOffPrev);
 
         LoadMatrix(matrix);
 
         // softmax over the last axis: row maximum, exp, row sum, normalize.
-        BlockReduceMax(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1, static_cast<int32_t>(kRowLanes));
-        PipeBarrier<PIPE_V>();
+        BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, static_cast<int32_t>(kRowLanes));
         Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
-        PipeBarrier<PIPE_V>();
-        Sub(mat, mat, div, static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        Exp(mat, mat, static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
-        BlockReduceSum(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1, static_cast<int32_t>(kRowLanes));
-        PipeBarrier<PIPE_V>();
+        Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        Exp<float, false>(mat, mat, MASK_PLACEHOLDER, 1, UnaryRepeatParams(1, 1, 8, 8));
+        BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, static_cast<int32_t>(kRowLanes));
         Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
-        PipeBarrier<PIPE_V>();
-        Div(mat, mat, div, static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
 
         // p = softmax(x) + eps on the valid lanes; padded rows are dropped.
-        Add(mat, mat, At<float>(kOffEps), static_cast<int32_t>(kLanes));
-        PipeBarrier<PIPE_V>();
+        Add<float, false>(mat, mat, At<float>(kOffEps), MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         if (n_ < kRowLanes) {
             Duplicate(mat[n_ * kRowLanes], 0.0F,
                       static_cast<int32_t>((kRowLanes - n_) * kRowLanes));
-            PipeBarrier<PIPE_V>();
-        }
+            }
 
         // First column normalization: sum over dim -2 plus eps.
-        NormalizeColumns(mat, tmpA, tmpB, sum, div, cons);
+        NormalizeColumns(mat, tmpA, tmpB, sum, div, cons, col);
+        Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
 
         for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
             // Row normalization: sum over dim -1 plus eps.
-            BlockReduceSum(sum, mat, 1, static_cast<int32_t>(kLanes), 1, 1,
-                           static_cast<int32_t>(kRowLanes));
-            PipeBarrier<PIPE_V>();
-            Add(sum, sum, cons, static_cast<int32_t>(kRowLanes));
-            PipeBarrier<PIPE_V>();
+            BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
+                                         static_cast<int32_t>(kRowLanes));
+            Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, BinParams());
             Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
-            PipeBarrier<PIPE_V>();
-            Div(mat, mat, div, static_cast<int32_t>(kLanes));
-            PipeBarrier<PIPE_V>();
-            NormalizeColumns(mat, tmpA, tmpB, sum, div, cons);
+            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinParams());
+            NormalizeColumns(mat, tmpA, tmpB, sum, div, cons, col);
+            if ((iteration & (kProbeEvery - 1U)) == 0U && TileSettled(mat, prev, tmpA, sum)) {
+                break;
+            }
+            Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
         }
 
         StoreMatrix(matrix);
@@ -221,7 +234,6 @@ private:
     TBuf<TPosition::VECCALC> arena_;
     GlobalTensor<DT_X> xGm_;
     GlobalTensor<DT_X> yGm_;
-    GM_ADDR yRaw_ = nullptr;
     MhcSinkhornTilingData tiling_{};
     uint32_t first_ = 0;
     uint32_t count_ = 0;
