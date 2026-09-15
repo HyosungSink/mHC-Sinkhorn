@@ -39,6 +39,21 @@ __aicore__ inline void Sync() {
     AscendC::SetFlag<event>(id);
     AscendC::WaitFlag<event>(id);
 }
+
+template <uint32_t Rows>
+__aicore__ inline bool RowsSettled(const LocalTensor<float> &sum,
+                                  const LocalTensor<float> &scratch) {
+    auto flags = scratch.ReinterpretCast<uint8_t>();
+    // A2 comparisons consume a complete vector; only real rows enter the test.
+    CompareScalar<float, uint8_t, false>(flags, sum, 1.0F + kSettledDev,
+        CMPMODE::GE, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+    CompareScalar<float, uint8_t, false>(flags[32], sum, 1.0F - kSettledDev,
+        CMPMODE::LT, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+    Sync<HardEvent::V_S>();
+    auto words = scratch.ReinterpretCast<uint32_t>();
+    constexpr uint32_t valid = static_cast<uint32_t>((1ULL << Rows) - 1ULL);
+    return ((words.GetValue(0) | words.GetValue(8)) & valid) == 0U;
+}
 }  // namespace
 
 template <typename DT_X>
@@ -465,15 +480,7 @@ public:
             Columns(mat);
             if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
                 BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-                SetVectorMask<float>(kRows * kBatch);
-                Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-                Abs<float, false>(probe, probe, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-                WholeReduceMax<float, false>(probe[64], probe, MASK_PLACEHOLDER,
-                    1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
-                Sync<HardEvent::V_S>();
-                const float deviation = probe.GetValue(64);
-                SetVectorMask<float>(64);
-                if (deviation <= kSettledDev) {
+                if (RowsSettled<kRows * kBatch>(sum, probe)) {
                     break;
                 }
             }
@@ -572,15 +579,7 @@ public:
             Columns(mat);
             if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
-                SetVectorMask<float>(8);
-                Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-                Abs<float, false>(probe, probe, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-                WholeReduceMax<float, false>(probe[64], probe, MASK_PLACEHOLDER,
-                    1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
-                Sync<HardEvent::V_S>();
-                const float deviation = probe.GetValue(64);
-                SetVectorMask<float>(64);
-                if (deviation <= kSettledDev) {
+                if (RowsSettled<8U>(sum, probe)) {
                     break;
                 }
             }
