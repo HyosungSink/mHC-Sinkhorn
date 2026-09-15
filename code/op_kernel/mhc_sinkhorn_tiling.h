@@ -20,6 +20,7 @@ struct MhcSinkhornTilingData {
     // tile lane each, the next 64 address one compact element each. Computing
     // them on the host keeps every per-row address out of the kernel.
     uint32_t gather[128];
+    uint32_t pairGather[208];
 };
 
 constexpr uint32_t kTilingWords = 8;    // scalar fields before gather[]

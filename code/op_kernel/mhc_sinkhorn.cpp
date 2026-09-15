@@ -348,6 +348,117 @@ private:
 };
 
 template <typename DT_X>
+class KernelMhcSinkhornPair {
+    template <typename U>
+    __aicore__ inline LocalTensor<U> At(uint32_t offset) {
+        return LocalTensor<U>(TPosition::VECCALC, offset, 1024U / sizeof(U));
+    }
+    __aicore__ inline void Columns(const LocalTensor<float> &mat) {
+        auto a = At<float>(1024);
+        auto b = At<float>(2048);
+        auto col = At<float>(5120);
+        auto div = At<float>(4096);
+        Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        Add<float, false>(b, a, a[16], MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        Add<float, false>(col, b, b[32], MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        SetVectorMask<float>(8);
+        Add<float, false>(col, col, At<float>(6144), MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 0});
+        SetVectorMask<float>(64);
+        Adds<float, false>(div, col, 0.0F, MASK_PLACEHOLDER, 2, {1, 0, 8, 8});
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+    }
+public:
+    __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
+                                    const MhcSinkhornTilingData &data) {
+        GlobalTensor<DT_X> xGm;
+        GlobalTensor<DT_X> yGm;
+        GlobalTensor<uint32_t> tables;
+        const uint64_t first = static_cast<uint64_t>(GetBlockIdx()) * 2U;
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x) + first * 36U);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y) + first * 36U);
+        tables.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling) + kTilingWords + kGatherWords);
+        auto mat = At<float>(0);
+        auto sum = At<float>(3072);
+        auto div = At<float>(4096);
+        auto cons = At<float>(6144);
+        auto eps = At<float>(7168);
+        auto stage = At<DT_X>(8192);
+        auto compact = At<float>(9216);
+        auto table = At<uint32_t>(10240);
+        auto probe = At<float>(11264);
+        auto output = At<DT_X>(12288);
+        DataCopyPad(table, tables, DataCopyExtParams{1, 208U * sizeof(uint32_t), 0, 0, 0},
+                    DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            DataCopyPad(compact, xGm, DataCopyExtParams{1, 72U * sizeof(float), 0, 0, 0},
+                        DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
+        } else {
+            DataCopyPad(stage, xGm, DataCopyExtParams{1, 72U * sizeof(DT_X), 0, 0, 0},
+                        DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
+        }
+        Duplicate(cons, 1.0F, 16);
+        SetVectorMask<float>(6);
+        Duplicate<float, false>(cons, data.eps, MASK_PLACEHOLDER, 2, 1, 1);
+        Duplicate(eps, 0.0F, 128);
+        SetVectorMask<float>(6);
+        Adds<float, false>(eps, eps, data.eps, MASK_PLACEHOLDER, 16, {1, 1, 1, 1});
+        SetVectorMask<float>(64);
+        compact.SetValue(120, kNegHuge);
+        Sync<HardEvent::S_V>();
+        Sync<HardEvent::MTE2_V>();
+        if constexpr (sizeof(DT_X) != sizeof(float)) {
+            Cast(compact, stage, RoundMode::CAST_NONE, 72);
+        }
+        Gather(mat, compact, table, 0, 128);
+        SetVectorMask<float>(64);
+        BlockReduceMax<float, false>(sum, mat, 2, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, 2, BrcbRepeatParams(1, 8));
+        Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        Exp<float, false>(mat, mat, MASK_PLACEHOLDER, 2, {1, 1, 8, 8});
+        BlockReduceSum<float, false>(sum, mat, 2, MASK_PLACEHOLDER, 1, 1, 8);
+        Brcb(div, sum, 2, BrcbRepeatParams(1, 8));
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+        SetVectorMask<float>(16);
+        Duplicate<float, false>(mat[48], 0.0F, MASK_PLACEHOLDER, 2, 1, 8);
+        SetVectorMask<float>(64);
+        Columns(mat);
+        for (uint32_t iteration = 1; iteration < data.iterations; ++iteration) {
+            BlockReduceSum<float, false>(sum, mat, 2, MASK_PLACEHOLDER, 1, 1, 8);
+            SetVectorMask<float>(16);
+            Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+            SetVectorMask<float>(64);
+            Brcb(div, sum, 2, BrcbRepeatParams(1, 8));
+            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 2, {1, 1, 1, 8, 8, 8});
+            Columns(mat);
+            if (data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+                BlockReduceSum<float, false>(sum, mat, 2, MASK_PLACEHOLDER, 1, 1, 8);
+                SetVectorMask<float>(0, 0x3f3fULL);
+                Adds<float, false>(probe, sum, -1.0F, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+                Abs<float, false>(probe, probe, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+                WholeReduceMax<float, false>(probe[64], probe, MASK_PLACEHOLDER,
+                    1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                Sync<HardEvent::V_S>();
+                const float deviation = probe.GetValue(64);
+                SetVectorMask<float>(64);
+                if (deviation <= kSettledDev) {
+                    break;
+                }
+            }
+        }
+        Gather(compact, mat, table[128], 0, 72);
+        if constexpr (sizeof(DT_X) == sizeof(float)) {
+            Sync<HardEvent::V_MTE3>();
+            DataCopyPad(yGm, compact, DataCopyExtParams{1, 72U * sizeof(float), 0, 0, 0});
+        } else {
+            Cast(output, compact, RoundMode::CAST_NONE, 72);
+            Sync<HardEvent::V_MTE3>();
+            DataCopyPad(yGm, output, DataCopyExtParams{1, 72U * sizeof(DT_X), 0, 0, 0});
+        }
+    }
+};
+
+template <typename DT_X>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights, GM_ADDR workspace,
                                         GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
@@ -366,8 +477,14 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     tiling_data.dtypeSize = raw->dtypeSize;
     tiling_data.reserved0 = 0U;
     tiling_data.reserved1 = 0U;
-    KernelMhcSinkhorn<DT_X> op;
-    op.Init(logits, weights, tiling, tiling_data);
-    op.Process();
+    if (tiling_data.n == 6U && tiling_data.matricesPerCore == 2U &&
+        static_cast<uint32_t>(GetBlockIdx()) * 2U + 1U < tiling_data.matrices) {
+        KernelMhcSinkhornPair<DT_X> op;
+        op.Process(logits, weights, tiling, tiling_data);
+    } else {
+        KernelMhcSinkhorn<DT_X> op;
+        op.Init(logits, weights, tiling, tiling_data);
+        op.Process();
+    }
     PipeBarrier<PIPE_ALL>();
 }
