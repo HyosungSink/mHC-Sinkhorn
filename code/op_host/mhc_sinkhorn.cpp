@@ -14,6 +14,7 @@ constexpr uint32_t kMaxOrder = 8;
 constexpr uint32_t kMaxIterations = 100;
 constexpr uint32_t kSingleMatrixDims = 3;
 constexpr uint32_t kBatchMatrixDims = 4;
+constexpr uint32_t kHeadBlocks = 8;  // block count with the lowest measured head cost
 
 bool SupportedOrder(int64_t order) {
     return order == 4 || order == 6 || order == 8;
@@ -81,7 +82,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         static_cast<int32_t>(tensor_x->GetOriginShape().GetDimNum()) - 1));
     const int32_t aivCores = platform.GetCoreNumAiv();
     const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
-    const uint32_t blockCount = std::min(matrices, cores);
+    // A microsecond scale kernel pays for every block it starts, but the head
+    // cost is not monotone in the block count: a single block pair is the most
+    // expensive configuration of all and the measured minimum sits near an
+    // octet of blocks before the cost climbs again towards the full core count.
+    // Small batches therefore ask for an octet of blocks as well and let the
+    // idle ones return immediately; larger batches keep one matrix per block up
+    // to the core count.
+    const uint32_t headBlocks = std::min<uint32_t>(kHeadBlocks, cores);
+    const uint32_t blockCount = std::min(std::max(matrices, headBlocks), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS);

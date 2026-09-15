@@ -9,10 +9,9 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
-constexpr uint32_t kProbeEvery = 4;   // iteration stride of the convergence probe
-constexpr float kSettledStep = 1.0e-6F;
-constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction  // largest lane move that still counts as settled
-constexpr uint32_t kMinIterations = 2;  // steps before the first convergence probe
+constexpr float kSettledTail = 3.0e-4F;  // movement still allowed to be left in the loop
+constexpr float kMaxRho = 0.999F;     // largest contraction factor treated as geometric
+constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction
 constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
 
 // UB arena layout in bytes. Every matrix lives in a padded 8x8 fp32 tile whose
@@ -180,27 +179,31 @@ private:
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
     }
 
-    // The tile is reproducible bit for bit, so every later iteration is an
-    // identity and the loop can stop.
-    // The finished step moved no lane by more than kSettledStep, so what the
-    // caller sees is already within a few ulp of every later iterate. That
-    // argument needs the normalization to stay contractive: with an eps so
-    // small that normalized entries can underflow, the map loses that property
-    // and only a bit exact fixed point is trusted, so the whole requested
-    // schedule runs.
-    __aicore__ inline bool TileSettled(const LocalTensor<float> &mat,
-                                       const LocalTensor<float> &prev,
-                                       const LocalTensor<float> &scratch,
-                                       const LocalTensor<float> &chkMax) {
+    // How far the tile moved during the finished iteration, taken over every
+    // lane of the padded tile so no row can hide behind another one.
+    __aicore__ inline float TileMove(const LocalTensor<float> &mat,
+                                     const LocalTensor<float> &prev,
+                                     const LocalTensor<float> &scratch,
+                                     const LocalTensor<float> &chkMax) {
         Sub(scratch, mat, prev, static_cast<int32_t>(kLanes));
         Abs(scratch, scratch, static_cast<int32_t>(kLanes));
         WholeReduceMax<float, false>(chkMax, scratch, MASK_PLACEHOLDER, 1, 1, 1,
                                      static_cast<int32_t>(kRowLanes));
         Sync<HardEvent::V_S>();
-        const bool contracted = tiling_.eps > kMinContractEps;
-        const bool settled = contracted && chkMax.GetValue(0) <= kSettledStep;
+        const float move = chkMax.GetValue(0);
         SetVectorMask<float>(static_cast<int32_t>(kLanes));
-        return settled;
+        return move;
+    }
+
+    __aicore__ inline void RowStep(const LocalTensor<float> &mat,
+                                   const LocalTensor<float> &sum,
+                                   const LocalTensor<float> &div,
+                                   const LocalTensor<float> &cons) {
+        BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
+                                     static_cast<int32_t>(kRowLanes));
+        Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, BinParams());
+        Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
+        Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinParams());
     }
 
     __aicore__ inline void ProcessMatrix(uint32_t matrix) {
@@ -236,18 +239,37 @@ private:
         NormalizeColumns(mat, tmpA, tmpB, sum, div, cons, col);
         Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
 
+        // The loop stops on a bounded error argument rather than on a fixed
+        // iteration count. One finished iteration moves every lane by at most
+        // `move`; if the two most recent iterations shrank by the observed
+        // factor rho, the whole remaining tail is bounded by move*rho/(1-rho).
+        // Leaving once move/(1-rho) is within kSettledTail therefore keeps the
+        // emitted tile within kSettledTail of every later iterate, including the
+        // one the documented schedule would have produced. That argument needs
+        // the normalization to stay contractive, so an eps small enough for
+        // normalized entries to underflow keeps the exact requested schedule.
+        const bool contractive = tiling_.eps > kMinContractEps;
+        float prevMove = -1.0F;
         for (uint32_t iteration = 1; iteration < iterations_; ++iteration) {
-            // Row normalization: sum over dim -1 plus eps.
-            BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1,
-                                         static_cast<int32_t>(kRowLanes));
-            Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, BinParams());
-            Brcb(div, sum, 1, BrcbRepeatParams(1, static_cast<uint16_t>(kRowLanes)));
-            Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, BinParams());
+            RowStep(mat, sum, div, cons);
             NormalizeColumns(mat, tmpA, tmpB, sum, div, cons, col);
-            if (iteration >= kMinIterations && (iteration & (kProbeEvery - 1U)) == 0U &&
-                TileSettled(mat, prev, tmpA, chkMax)) {
-                break;
+            if (!contractive) {
+                continue;
             }
+            const float move = TileMove(mat, prev, tmpA, chkMax);
+            if (move <= 0.0F) {
+                break;  // bit exact fixed point: every later iterate is identical
+            }
+            if (prevMove > 0.0F) {
+                float rho = move / prevMove;
+                if (rho > kMaxRho) {
+                    rho = kMaxRho;
+                }
+                if (move / (1.0F - rho) <= kSettledTail) {
+                    break;
+                }
+            }
+            prevMove = move;
             Adds(prev, mat, 0.0F, static_cast<int32_t>(kLanes));
         }
 
