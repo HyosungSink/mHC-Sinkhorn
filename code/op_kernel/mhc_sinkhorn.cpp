@@ -399,7 +399,7 @@ class KernelMhcSinkhornPair {
     }
 public:
     __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
-                                    const MhcSinkhornTilingData &data) {
+                                    uint32_t iterations, float epsValue) {
         GlobalTensor<DT_X> xGm;
         GlobalTensor<DT_X> yGm;
         GlobalTensor<uint32_t> tables;
@@ -431,14 +431,14 @@ public:
         }
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
-            Duplicate(cons, data.eps, N);
+            Duplicate(cons, epsValue, N);
             for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
                 compact.SetValue(252U + pair * 2U * N * N, kNegHuge);
             }
             Sync<HardEvent::S_V>();
         } else {
-            Duplicate(cons, data.eps, 8U * kBatch);
-            Duplicate(eps, data.eps, 64U * kBatch);
+            Duplicate(cons, epsValue, 8U * kBatch);
+            Duplicate(eps, epsValue, 64U * kBatch);
         }
         Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) != sizeof(float)) {
@@ -460,17 +460,17 @@ public:
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         if constexpr (N == 6U) {
             SetVectorMask<float>(6);
-            Adds<float, false>(mat, mat, data.eps, MASK_PLACEHOLDER, 24, {1, 1, 1, 1});
+            Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, 24, {1, 1, 1, 1});
             SetVectorMask<float>(64);
         } else {
             Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         }
         Columns(mat);
-        for (uint32_t iteration = 1; iteration < data.iterations; ++iteration) {
+        for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
             SetVectorMask<float>(kRows * kBatch);
             if constexpr (N == 6U) {
-                Adds<float, false>(sum, sum, data.eps, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+                Adds<float, false>(sum, sum, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             } else {
                 Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             }
@@ -478,7 +478,7 @@ public:
             Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
             Columns(mat);
-            if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+            if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
                 BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
                 if (RowsSettled<kRows * kBatch>(sum, probe)) {
                     break;
@@ -522,7 +522,7 @@ class KernelMhcSinkhornNarrowPair {
     }
 public:
     __aicore__ inline void Process(GM_ADDR x, GM_ADDR y, GM_ADDR tiling,
-                                    const MhcSinkhornTilingData &data) {
+                                    uint32_t iterations, float epsValue) {
         GlobalTensor<DT_X> xGm;
         GlobalTensor<DT_X> yGm;
         GlobalTensor<uint32_t> tables;
@@ -549,7 +549,7 @@ public:
                         DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
         }
         Duplicate(cons, 1.0F, 8);
-        Duplicate(cons, data.eps, 4);
+        Duplicate(cons, epsValue, 4);
         compact.SetValue(252, kNegHuge);
         Sync<HardEvent::S_V>();
         Sync<HardEvent::MTE2_V>();
@@ -566,18 +566,18 @@ public:
         Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
         SetVectorMask<float>(4);
-        Adds<float, false>(mat, mat, data.eps, MASK_PLACEHOLDER, 8, {1, 1, 1, 1});
+        Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, 8, {1, 1, 1, 1});
         SetVectorMask<float>(64);
         Columns(mat);
-        for (uint32_t iteration = 1; iteration < data.iterations; ++iteration) {
+        for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
             SetVectorMask<float>(8);
-            Adds<float, false>(sum, sum, data.eps, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<float, false>(sum, sum, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<float>(64);
             Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             Columns(mat);
-            if (iteration >= 2U && data.eps > kMinContractEps && iteration + 1U < data.iterations) {
+            if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
                 if (RowsSettled<8U>(sum, probe)) {
                     break;
@@ -605,20 +605,33 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
             return;
         }
     }
-    // The six fields this kernel needs are read straight from the tiling block
-    // as scalars. The structured copy would move the whole block onto the stack
-    // first, and at this kernel size that copy alone costs a few hundred
-    // nanoseconds, more than the arithmetic it describes.
     __gm__ const MhcSinkhornTilingData *raw =
         reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
-    if constexpr (GROUP_ORDER == 8U && ACTIVE_GROUPS == 0U) {
+    const uint32_t matrices = raw->matrices;
+    if constexpr (GROUP_ORDER != 0U) {
         constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
-        if (static_cast<uint32_t>(GetBlockIdx()) * groupMatrices >= raw->matrices) {
+        const uint32_t first = static_cast<uint32_t>(GetBlockIdx()) * groupMatrices;
+        if constexpr (GROUP_ORDER == 8U && ACTIVE_GROUPS == 0U) {
+            if (first >= matrices) {
+                return;
+            }
+        }
+        if (first + groupMatrices <= matrices) {
+            const uint32_t iterations = raw->iterations;
+            const float epsValue = raw->eps;
+            if constexpr (GROUP_ORDER == 4U) {
+                KernelMhcSinkhornNarrowPair<DT_X> op;
+                op.Process(logits, weights, tiling, iterations, epsValue);
+            } else {
+                KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
+                op.Process(logits, weights, tiling, iterations, epsValue);
+            }
+            PipeBarrier<PIPE_ALL>();
             return;
         }
     }
     MhcSinkhornTilingData tiling_data;
-    tiling_data.matrices = raw->matrices;
+    tiling_data.matrices = matrices;
     tiling_data.matricesPerCore = raw->matricesPerCore;
     tiling_data.n = raw->n;
     tiling_data.iterations = raw->iterations;
@@ -626,20 +639,6 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     tiling_data.dtypeSize = raw->dtypeSize;
     tiling_data.reserved0 = 0U;
     tiling_data.reserved1 = 0U;
-    if constexpr (GROUP_ORDER != 0U) {
-        constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
-        if (static_cast<uint32_t>(GetBlockIdx()) * groupMatrices + groupMatrices <= tiling_data.matrices) {
-            if constexpr (GROUP_ORDER == 4U) {
-                KernelMhcSinkhornNarrowPair<DT_X> op;
-                op.Process(logits, weights, tiling, tiling_data);
-            } else {
-                KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
-                op.Process(logits, weights, tiling, tiling_data);
-            }
-            PipeBarrier<PIPE_ALL>();
-            return;
-        }
-    }
     KernelMhcSinkhorn<DT_X> op;
     op.Init(logits, weights, tiling, tiling_data);
     op.Process();
