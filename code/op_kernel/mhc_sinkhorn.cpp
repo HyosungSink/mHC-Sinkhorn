@@ -362,9 +362,9 @@ private:
     uint32_t iterations_ = 0;
 };
 
-template <typename DT_X, uint32_t N, uint32_t BATCH = 4U>
+template <typename DT_X, uint32_t N>
 class KernelMhcSinkhornPair {
-    static constexpr uint32_t kBatch = BATCH;
+    static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
     static constexpr uint32_t kRows = N == 6U ? 6U : 8U;
     static constexpr uint32_t kRepeats = kRows * kBatch / 8U;
@@ -388,12 +388,9 @@ class KernelMhcSinkhornPair {
             Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 6, 6, 1});
             SetVectorMask<float>(64);
         } else {
-            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, kBatch / 2U, {1, 2, 2, 8, 16, 16});
-            if constexpr (kBatch == 2U) {
-                SetVectorMask<float>(32);
-            }
+            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 2, 2, 8, 16, 16});
             Add<float, false>(b, a, a[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
-            SetVectorMask<float>(kBatch * 8U);
+            SetVectorMask<float>(32);
             Add<float, false>(col, b, b[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
             Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
             SetVectorMask<float>(64);
@@ -641,6 +638,9 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
         if (static_cast<uint32_t>(GetBlockIdx()) >= ACTIVE_GROUPS) {
             return;
         }
+        if constexpr (GROUP_ORDER == 4U) {
+            ICachePreLoad(1);
+        }
         // Static groups contain no partial matrix group; the Host checks this.
         __gm__ const MhcSinkhornTilingData *groupData =
             reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
@@ -648,9 +648,6 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
         const float epsValue = groupData->eps;
         if constexpr (GROUP_ORDER == 4U) {
             KernelMhcSinkhornNarrowPair<DT_X> op;
-            op.Process(logits, weights, tiling, iterations, epsValue);
-        } else if constexpr (GROUP_ORDER == 9U) {
-            KernelMhcSinkhornPair<DT_X, 8U, 2U> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         } else {
             KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
@@ -663,9 +660,9 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
         reinterpret_cast<__gm__ const MhcSinkhornTilingData *>(tiling);
     const uint32_t matrices = raw->matrices;
     if constexpr (GROUP_ORDER != 0U) {
-        constexpr uint32_t groupMatrices = GROUP_ORDER == 4U || GROUP_ORDER == 9U ? 2U : 4U;
+        constexpr uint32_t groupMatrices = GROUP_ORDER == 4U ? 2U : 4U;
         const uint32_t first = static_cast<uint32_t>(GetBlockIdx()) * groupMatrices;
-        if constexpr ((GROUP_ORDER == 8U || GROUP_ORDER == 9U) && ACTIVE_GROUPS == 0U) {
+        if constexpr (GROUP_ORDER == 8U && ACTIVE_GROUPS == 0U) {
             if (first >= matrices) {
                 return;
             }
@@ -675,9 +672,6 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
             const float epsValue = raw->eps;
             if constexpr (GROUP_ORDER == 4U) {
                 KernelMhcSinkhornNarrowPair<DT_X> op;
-                op.Process(logits, weights, tiling, iterations, epsValue);
-            } else if constexpr (GROUP_ORDER == 9U) {
-                KernelMhcSinkhornPair<DT_X, 8U, 2U> op;
                 op.Process(logits, weights, tiling, iterations, epsValue);
             } else {
                 KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
