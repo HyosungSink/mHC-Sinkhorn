@@ -388,13 +388,13 @@ class KernelMhcSinkhornPair {
             Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 6, 6, 1});
             SetVectorMask<float>(64);
         } else {
-            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-            Add<float, false>(b, a, a[16], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-            Add<float, false>(col, b, b[32], MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 8});
-            SetVectorMask<float>(8);
-            Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, kBatch, {1, 1, 1, 8, 8, 0});
+            Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 2, 2, 8, 16, 16});
+            Add<float, false>(b, a, a[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
+            SetVectorMask<float>(32);
+            Add<float, false>(col, b, b[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
+            Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
             SetVectorMask<float>(64);
-            Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 8});
+            Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 1});
         }
     }
 public:
@@ -505,13 +505,12 @@ class KernelMhcSinkhornNarrowPair {
     __aicore__ inline void Columns(const LocalTensor<float> &mat) {
         auto a = At<float>(1024);
         auto col = At<float>(2048);
-        auto div = At<float>(4096);
-        Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
-        Add<float, false>(col, a, a[16], MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
-        SetVectorMask<float>(8);
-        Add<float, false>(col, col, At<float>(5120), MASK_PLACEHOLDER, 2, {1, 1, 1, 4, 4, 0});
+        Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
+        SetVectorMask<float>(16);
+        Add<float, false>(col, a, a[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
+        Add<float, false>(col, col, At<float>(5120), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
         SetVectorMask<float>(32);
-        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, 2, {1, 1, 0, 4, 4, 4});
+        Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, 2, {1, 1, 0, 4, 4, 1});
         SetVectorMask<float>(64);
     }
 public:
