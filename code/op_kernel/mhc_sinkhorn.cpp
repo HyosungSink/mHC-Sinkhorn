@@ -414,7 +414,6 @@ public:
         auto sum = At<float>(6144);
         auto div = At<float>(8192);
         auto cons = At<float>(12288);
-        auto eps = At<float>(14336);
         auto stage = At<DT_X>(16384);
         auto compact = At<float>(18432);
         auto table = At<uint32_t>(20480);
@@ -451,7 +450,6 @@ public:
             Duplicate(mat, kNegHuge, kGroupLanes);
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
-            Duplicate(eps, epsValue, 64U * kBatch);
         }
         Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) != sizeof(float)) {
@@ -472,10 +470,10 @@ public:
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         if constexpr (N == 6U) {
             SetVectorMask<float>(0ULL, 0x3F3F3F3F3F3F3F3FULL);
-            Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, kRepeats, {1, 1, 8, 8});
+            Add<float, false>(mat, mat, cons, MASK_PLACEHOLDER, kRepeats, {1, 1, 0, 8, 8, 0});
             SetVectorMask<float>(64);
         } else {
-            Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
+            Add<float, false>(mat, mat, cons, MASK_PLACEHOLDER, kRepeats, {1, 1, 0, 8, 8, 0});
         }
         Columns(mat);
         if constexpr (N == 6U) {
