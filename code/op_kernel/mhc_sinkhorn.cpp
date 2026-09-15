@@ -560,6 +560,16 @@ public:
         auto table = At<uint32_t>(8192);
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
+        auto rowSeed = At<uint64_t>(3072);
+        auto columnSeed = At<uint64_t>(4096);
+        rowSeed.SetValue(0, 0x0000001000000000ULL);
+        rowSeed.SetValue(1, 0x0000003000000020ULL);
+        rowSeed.SetValue(2, 0x0000005000000040ULL);
+        rowSeed.SetValue(3, 0x0000007000000060ULL);
+        columnSeed.SetValue(0, 0x0000000400000000ULL);
+        columnSeed.SetValue(1, 0x0000000C00000008ULL);
+        columnSeed.SetValue(2, 0ULL);
+        columnSeed.SetValue(3, 0ULL);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             DataCopyPad(compact, xGm, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0},
                         DataCopyPadExtParams<float>{false, 0, 0, 0.0F});
@@ -571,17 +581,10 @@ public:
         Duplicate(cons, epsValue, 4);
         auto offsets = At<int32_t>(8192);
         auto pattern = At<uint32_t>(8448);
-        Duplicate(offsets, static_cast<int32_t>(0), 64);
-        SetVectorMask<int32_t>(0ULL, 0xAAAAAAAAAAAAAAAAULL);
-        Adds<int32_t, false>(offsets, offsets, 4, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-        SetVectorMask<int32_t>(0ULL, 0xCCCCCCCCCCCCCCCCULL);
-        Adds<int32_t, false>(offsets, offsets, 8, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-        SetVectorMask<int32_t>(0ULL, 0xFF00FF00FF00FF00ULL);
-        Adds<int32_t, false>(offsets, offsets, 16, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-        SetVectorMask<int32_t>(0ULL, 0xFFFF0000FFFF0000ULL);
-        Adds<int32_t, false>(offsets, offsets, 32, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-        SetVectorMask<int32_t>(0ULL, 0xFFFFFFFF00000000ULL);
-        Adds<int32_t, false>(offsets, offsets, 64, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+        Sync<HardEvent::S_V>();
+        SetVectorMask<int32_t>(64);
+        Brcb(offsets, At<int32_t>(3072), 1, BrcbRepeatParams(1, 8));
+        Add<int32_t, false>(offsets, offsets, At<int32_t>(4096), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
         Duplicate(pattern, 0x0F0F0F0FU, 8);
         Duplicate(mat, kNegHuge, 64);
         Sync<HardEvent::MTE2_V>();
@@ -637,9 +640,6 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
     if constexpr (GROUP_ORDER != 0U && ACTIVE_GROUPS != 0U) {
         if (static_cast<uint32_t>(GetBlockIdx()) >= ACTIVE_GROUPS) {
             return;
-        }
-        if constexpr (GROUP_ORDER == 4U) {
-            ICachePreLoad(1);
         }
         // Static groups contain no partial matrix group; the Host checks this.
         __gm__ const MhcSinkhornTilingData *groupData =
