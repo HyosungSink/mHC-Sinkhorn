@@ -402,11 +402,9 @@ public:
                                     uint32_t iterations, float epsValue) {
         GlobalTensor<DT_X> xGm;
         GlobalTensor<DT_X> yGm;
-        GlobalTensor<uint32_t> tables;
         const uint64_t first = static_cast<uint64_t>(GetBlockIdx()) * kBatch;
         xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x) + first * N * N);
         yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y) + first * N * N);
-        tables.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t *>(tiling) + kTilingWords + kGatherWords);
         auto mat = At<float>(0);
         auto sum = At<float>(6144);
         auto div = At<float>(8192);
@@ -418,10 +416,6 @@ public:
         auto pattern = At<uint32_t>(21248);
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
-        if constexpr (N < 8U) {
-            DataCopyPad(table, tables, DataCopyExtParams{1, kGroupLanes * sizeof(uint32_t), 0, 0, 0},
-                        DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
-        }
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             auto input = N < 8U ? compact : mat;
             DataCopyPad(input, xGm, DataCopyExtParams{1, kElements * sizeof(float), 0, 0, 0},
@@ -434,8 +428,24 @@ public:
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
             Duplicate(pattern, 0x3F3F3F3FU, 8);
-            compact.SetValue(252U, kNegHuge);
-            Sync<HardEvent::S_V>();
+            auto offsets = At<int32_t>(20480);
+            Duplicate(offsets, static_cast<int32_t>(0), 64);
+            SetVectorMask<int32_t>(0ULL, 0xAAAAAAAAAAAAAAAAULL);
+            Adds<int32_t, false>(offsets, offsets, 4, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(0ULL, 0xCCCCCCCCCCCCCCCCULL);
+            Adds<int32_t, false>(offsets, offsets, 8, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(0ULL, 0xF0F0F0F0F0F0F0F0ULL);
+            Adds<int32_t, false>(offsets, offsets, 16, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(0ULL, 0xFF00FF00FF00FF00ULL);
+            Adds<int32_t, false>(offsets, offsets, 24, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(0ULL, 0xFFFF0000FFFF0000ULL);
+            Adds<int32_t, false>(offsets, offsets, 48, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(0ULL, 0xFFFFFFFF00000000ULL);
+            Adds<int32_t, false>(offsets, offsets, 96, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            SetVectorMask<int32_t>(64);
+            Adds<int32_t, false>(offsets[64], offsets, 192, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets[128], offsets, 384, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Duplicate(mat, kNegHuge, kGroupLanes);
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
             Duplicate(eps, epsValue, 64U * kBatch);
@@ -446,7 +456,8 @@ public:
             Cast(input, stage, RoundMode::CAST_NONE, kElements);
         }
         if constexpr (N < 8U) {
-            Gather(mat, compact, table, 0, kGroupLanes);
+            uint64_t validRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0ULL};
+            Gather(mat, compact, table, 0, validRows, kRepeats, 8);
         }
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
