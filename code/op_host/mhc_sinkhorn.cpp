@@ -136,7 +136,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     }
     context->GetRawTilingData()->SetDataSize(payloadBytes);
     context->SetBlockDim(blockCount);
-    if (context->SetScheduleMode(ACTIVE_GROUPS != 0U ? 1U : 0U) != ge::GRAPH_SUCCESS) {
+    if (context->SetScheduleMode(ACTIVE_GROUPS != 0U && order != 4U ? 1U : 0U) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
