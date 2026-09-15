@@ -49,7 +49,7 @@ __aicore__ inline bool RowsSettled(const LocalTensor<float> &sum,
         CMPMODE::GE, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
     CompareScalar<float, uint8_t, false>(flags[32], sum, 1.0F - kSettledDev,
         CMPMODE::LT, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-    Sync<HardEvent::V_S>();
+    // The compiler synchronizes GetValue with the vector comparison results.
     auto words = scratch.ReinterpretCast<uint32_t>();
     constexpr uint32_t valid = static_cast<uint32_t>((1ULL << Rows) - 1ULL);
     return ((words.GetValue(0) | words.GetValue(8)) & valid) == 0U;
@@ -433,7 +433,6 @@ public:
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
             compact.SetValue(252U, kNegHuge);
-            Sync<HardEvent::S_V>();
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
             Duplicate(eps, epsValue, 64U * kBatch);
@@ -544,7 +543,6 @@ public:
         Duplicate(cons, 1.0F, 8);
         Duplicate(cons, epsValue, 4);
         compact.SetValue(252, kNegHuge);
-        Sync<HardEvent::S_V>();
         Sync<HardEvent::MTE2_V>();
         if constexpr (sizeof(DT_X) != sizeof(float)) {
             Cast(compact, stage, RoundMode::CAST_NONE, 32);
