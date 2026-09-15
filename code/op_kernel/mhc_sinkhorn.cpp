@@ -418,13 +418,6 @@ public:
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
         if constexpr (N < 8U) {
-            if constexpr (sizeof(DT_X) == sizeof(float)) {
-                compact.SetValue(252U, kNegHuge);
-            } else {
-                stage.SetValue(252U, static_cast<DT_X>(kNegHuge));
-            }
-        }
-        if constexpr (N < 8U) {
             DataCopyPad(table, tables, DataCopyExtParams{1, 336U * sizeof(uint32_t), 0, 0, 0},
                         DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         }
@@ -439,22 +432,19 @@ public:
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
+            compact.SetValue(252U, kNegHuge);
             Sync<HardEvent::S_V>();
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
             Duplicate(eps, epsValue, 64U * kBatch);
         }
         Sync<HardEvent::MTE2_V>();
-        if constexpr (sizeof(DT_X) == sizeof(float)) {
-            if constexpr (N < 8U) {
-                Gather(mat, compact, table, 0, kGroupLanes);
-            }
-        } else if constexpr (N < 8U) {
-            auto narrow = At<DT_X>(18432);
-            Gather(narrow, stage, table, 0, kGroupLanes);
-            Cast(mat, narrow, RoundMode::CAST_NONE, kGroupLanes);
-        } else {
-            Cast(mat, stage, RoundMode::CAST_NONE, kElements);
+        if constexpr (sizeof(DT_X) != sizeof(float)) {
+            auto input = N < 8U ? compact : mat;
+            Cast(input, stage, RoundMode::CAST_NONE, kElements);
+        }
+        if constexpr (N < 8U) {
+            Gather(mat, compact, table, 0, kGroupLanes);
         }
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
@@ -491,21 +481,15 @@ public:
                 }
             }
         }
+        if constexpr (N < 8U) {
+            Gather(compact, mat, table[kGroupLanes], 0, kElements);
+        }
+        auto packed = N < 8U ? compact : mat;
         if constexpr (sizeof(DT_X) == sizeof(float)) {
-            if constexpr (N < 8U) {
-                Gather(compact, mat, table[kGroupLanes], 0, kElements);
-            }
-            auto packed = N < 8U ? compact : mat;
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm, packed, DataCopyExtParams{1, kElements * sizeof(float), 0, 0, 0});
         } else {
-            if constexpr (N < 8U) {
-                auto narrow = At<DT_X>(18432);
-                Cast(narrow, mat, RoundMode::CAST_NONE, kGroupLanes);
-                Gather(output, narrow, table[kGroupLanes], 0, kElements);
-            } else {
-                Cast(output, mat, RoundMode::CAST_NONE, kElements);
-            }
+            Cast(output, packed, RoundMode::CAST_NONE, kElements);
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm, output, DataCopyExtParams{1, kElements * sizeof(DT_X), 0, 0, 0});
         }
@@ -549,11 +533,6 @@ public:
         auto table = At<uint32_t>(8192);
         auto probe = At<float>(9216);
         auto output = At<DT_X>(10240);
-        if constexpr (sizeof(DT_X) == sizeof(float)) {
-            compact.SetValue(252, kNegHuge);
-        } else {
-            stage.SetValue(252, static_cast<DT_X>(kNegHuge));
-        }
         DataCopyPad(table, tables, DataCopyExtParams{1, 96U * sizeof(uint32_t), 0, 0, 0},
                     DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         if constexpr (sizeof(DT_X) == sizeof(float)) {
@@ -565,15 +544,13 @@ public:
         }
         Duplicate(cons, 1.0F, 8);
         Duplicate(cons, epsValue, 4);
+        compact.SetValue(252, kNegHuge);
         Sync<HardEvent::S_V>();
         Sync<HardEvent::MTE2_V>();
-        if constexpr (sizeof(DT_X) == sizeof(float)) {
-            Gather(mat, compact, table, 0, 64);
-        } else {
-            auto narrow = At<DT_X>(7168);
-            Gather(narrow, stage, table, 0, 64);
-            Cast(mat, narrow, RoundMode::CAST_NONE, 64);
+        if constexpr (sizeof(DT_X) != sizeof(float)) {
+            Cast(compact, stage, RoundMode::CAST_NONE, 32);
         }
+        Gather(mat, compact, table, 0, 64);
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
         Brcb(div, sum, 1, BrcbRepeatParams(1, 8));
@@ -601,13 +578,12 @@ public:
                 }
             }
         }
+        Gather(compact, mat, table[64], 0, 32);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
-            Gather(compact, mat, table[64], 0, 32);
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm, compact, DataCopyExtParams{1, 32U * sizeof(float), 0, 0, 0});
         } else {
-            Cast(stage, mat, RoundMode::CAST_NONE, 64);
-            Gather(output, stage, table[64], 0, 32);
+            Cast(output, compact, RoundMode::CAST_NONE, 32);
             Sync<HardEvent::V_MTE3>();
             DataCopyPad(yGm, output, DataCopyExtParams{1, 32U * sizeof(DT_X), 0, 0, 0});
         }

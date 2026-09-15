@@ -126,7 +126,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
     }
 
-    const uint32_t groupElementBytes = tiling->dtypeSize;
     if (order == 4U) {
         for (uint32_t slot = 0; slot < 336U; ++slot) {
             tiling->pairGather[slot] = 0U;
@@ -136,11 +135,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 32U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (column < 4U ?
-                matrix * 16U + row * 4U + column : 252U) * groupElementBytes;
+                matrix * 16U + row * 4U + column : 252U) * sizeof(float);
         }
         for (uint32_t slot = 0; slot < 32U; ++slot) {
             tiling->pairGather[64U + slot] = ((slot / 16U) * 32U +
-                ((slot % 16U) / 4U) * 8U + slot % 4U) * groupElementBytes;
+                ((slot % 16U) / 4U) * 8U + slot % 4U) * sizeof(float);
         }
     } else if (order == 6U) {
         for (uint32_t slot = 0; slot < 192U; ++slot) {
@@ -148,11 +147,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 48U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (column < 6U ?
-                matrix * 36U + row * 6U + column : 252U) * groupElementBytes;
+                matrix * 36U + row * 6U + column : 252U) * sizeof(float);
         }
         for (uint32_t slot = 0; slot < 144U; ++slot) {
             tiling->pairGather[192U + slot] = ((slot / 36U) * 48U +
-                ((slot % 36U) / 6U) * 8U + slot % 6U) * groupElementBytes;
+                ((slot % 36U) / 6U) * 8U + slot % 6U) * sizeof(float);
         }
     } else {
         for (uint32_t slot = 0; slot < 336U; ++slot) {
@@ -160,14 +159,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 64U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (row < order && column < order ?
-                batch * order * order + row * order + column : 252U) * groupElementBytes;
+                batch * order * order + row * order + column : 252U) * sizeof(float);
         }
         for (uint32_t slot = 0; slot < 80U; ++slot) {
             const uint32_t batch = slot / (order * order);
             const uint32_t row = (slot % (order * order)) / order;
             const uint32_t column = slot % order;
             tiling->pairGather[128U + slot] = (slot < 2U * order * order ?
-                batch * 64U + row * 8U + column : 0U) * groupElementBytes;
+                batch * 64U + row * 8U + column : 0U) * sizeof(float);
         }
     }
 
