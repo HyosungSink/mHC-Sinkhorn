@@ -362,7 +362,7 @@ private:
     uint32_t iterations_ = 0;
 };
 
-template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true>
+template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true, bool FULL_ROW_MASK = false>
 class KernelMhcSinkhornPair {
     static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
@@ -485,13 +485,17 @@ public:
             if constexpr (N != 6U) {
                 BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
             }
-            SetVectorMask<float>(kRows * kBatch);
+            if constexpr (!FULL_ROW_MASK) {
+                SetVectorMask<float>(kRows * kBatch);
+            }
             if constexpr (N == 6U) {
                 Adds<float, false>(sum, sum, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             } else {
                 Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             }
-            SetVectorMask<float>(64);
+            if constexpr (!FULL_ROW_MASK) {
+                SetVectorMask<float>(64);
+            }
             Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
             Columns(mat);
@@ -645,7 +649,7 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
             KernelMhcSinkhornNarrowPair<DT_X> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         } else {
-            KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
+            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, (GROUP_ORDER == 8U && ACTIVE_GROUPS == 1U)> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         }
         PipeBarrier<PIPE_ALL>();
@@ -669,7 +673,7 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
                 KernelMhcSinkhornNarrowPair<DT_X> op;
                 op.Process(logits, weights, tiling, iterations, epsValue);
             } else {
-                KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
+                KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, (GROUP_ORDER == 8U && ACTIVE_GROUPS == 1U)> op;
                 op.Process(logits, weights, tiling, iterations, epsValue);
             }
             PipeBarrier<PIPE_ALL>();
