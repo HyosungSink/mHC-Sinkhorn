@@ -390,10 +390,9 @@ class KernelMhcSinkhornPair {
         } else {
             Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 2, 2, 8, 16, 16});
             Add<float, false>(b, a, a[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
-            SetVectorMask<float>(32);
+            // The division consumes only the first four column blocks.
             Add<float, false>(col, b, b[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
             Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
-            SetVectorMask<float>(64);
             Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 8, 8, 1});
         }
     }
