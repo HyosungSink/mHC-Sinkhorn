@@ -86,7 +86,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     // Each task holds a complete group of independent matrices.
     const uint32_t groupMatrices = order == 4U ? 2U : 4U;
     const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
-    const uint32_t blockCount = std::min(std::max(tasks, 16U), cores);
+    const uint32_t blockCount = std::min(std::max(tasks, 8U), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
     const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
@@ -126,6 +126,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         tiling->gather[64U + slot] = offset * static_cast<uint32_t>(sizeof(float));
     }
 
+    const uint32_t groupElementBytes = tiling->dtypeSize;
     if (order == 4U) {
         for (uint32_t slot = 0; slot < 336U; ++slot) {
             tiling->pairGather[slot] = 0U;
@@ -135,11 +136,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 32U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (column < 4U ?
-                matrix * 16U + row * 4U + column : 252U) * sizeof(float);
+                matrix * 16U + row * 4U + column : 252U) * groupElementBytes;
         }
         for (uint32_t slot = 0; slot < 32U; ++slot) {
             tiling->pairGather[64U + slot] = ((slot / 16U) * 32U +
-                ((slot % 16U) / 4U) * 8U + slot % 4U) * sizeof(float);
+                ((slot % 16U) / 4U) * 8U + slot % 4U) * groupElementBytes;
         }
     } else if (order == 6U) {
         for (uint32_t slot = 0; slot < 192U; ++slot) {
@@ -147,11 +148,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 48U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (column < 6U ?
-                matrix * 36U + row * 6U + column : 252U) * sizeof(float);
+                matrix * 36U + row * 6U + column : 252U) * groupElementBytes;
         }
         for (uint32_t slot = 0; slot < 144U; ++slot) {
             tiling->pairGather[192U + slot] = ((slot / 36U) * 48U +
-                ((slot % 36U) / 6U) * 8U + slot % 6U) * sizeof(float);
+                ((slot % 36U) / 6U) * 8U + slot % 6U) * groupElementBytes;
         }
     } else {
         for (uint32_t slot = 0; slot < 336U; ++slot) {
@@ -159,14 +160,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 64U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (row < order && column < order ?
-                batch * order * order + row * order + column : 252U) * sizeof(float);
+                batch * order * order + row * order + column : 252U) * groupElementBytes;
         }
         for (uint32_t slot = 0; slot < 80U; ++slot) {
             const uint32_t batch = slot / (order * order);
             const uint32_t row = (slot % (order * order)) / order;
             const uint32_t column = slot % order;
             tiling->pairGather[128U + slot] = (slot < 2U * order * order ?
-                batch * 64U + row * 8U + column : 0U) * sizeof(float);
+                batch * 64U + row * 8U + column : 0U) * groupElementBytes;
         }
     }
 
