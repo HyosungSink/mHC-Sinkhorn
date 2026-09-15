@@ -91,7 +91,7 @@ private:
         LocalTensor<float> eps = At<float>(kOffEps);
         const float epsValue = tiling_.eps;
         // The guard vector is one full fill followed by a narrow fill from lane
-        // zero: a partial write at lane n would start on a misaligned address.
+        // zero: a partial fill at lane n would start off the 32B boundary.
         // The padding lanes keep 1.0 so that a zero column can never divide by
         // zero, and no subtraction is involved because (eps - 1) rounds to -1
         // for the tiny eps values the contract allows.
