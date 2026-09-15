@@ -84,7 +84,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const int32_t aivCores = platform.GetCoreNumAiv();
     const uint32_t cores = static_cast<uint32_t>(aivCores > 0 ? aivCores : 1);
     // Each task holds a complete group of independent matrices.
-    const uint32_t groupMatrices = order == 4U ? 2U : 4U;
+    const uint32_t groupMatrices = order == 4U ? 2U : (matrices >= 8U ? 8U : 4U);
     const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
     const uint32_t blockCount = std::min(std::max(tasks, 8U), cores);
 
@@ -93,7 +93,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
     const uint32_t ACTIVE_GROUPS = GROUP_ORDER != 0U &&
         (tasks == 1U || tasks == 2U || tasks == 4U) ? tasks : 0U;
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS);
+    const bool PACK_EIGHT = GROUP_ORDER != 0U && groupMatrices == 8U;
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER, ACTIVE_GROUPS, PACK_EIGHT);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
     if (tiling == nullptr) {
@@ -150,7 +151,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
             const uint32_t row = (slot % 48U) / 8U;
             const uint32_t column = slot % 8U;
             tiling->pairGather[slot] = (column < 6U ?
-                matrix * 36U + row * 6U + column : 252U) * sizeof(float);
+                matrix * 36U + row * 6U + column : (groupMatrices == 8U ? 508U : 252U)) * sizeof(float);
         }
         for (uint32_t slot = 0; slot < 72U; ++slot) {
             tiling->pairGather[96U + slot] = ((slot / 36U) * 48U +
