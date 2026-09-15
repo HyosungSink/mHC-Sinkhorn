@@ -470,7 +470,7 @@ public:
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
         if constexpr (N == 6U) {
             SetVectorMask<float>(0ULL, 0x3F3F3F3F3F3F3F3FULL);
-            Add<float, false>(mat, mat, cons, MASK_PLACEHOLDER, kRepeats, {1, 1, 0, 8, 8, 0});
+            Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, kRepeats, {1, 1, 8, 8});
             SetVectorMask<float>(64);
         } else {
             Add<float, false>(mat, mat, cons, MASK_PLACEHOLDER, kRepeats, {1, 1, 0, 8, 8, 0});
