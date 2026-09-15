@@ -424,6 +424,9 @@ public:
             DataCopyPad(stage, xGm, DataCopyExtParams{1, kElements * sizeof(DT_X), 0, 0, 0},
                         DataCopyPadExtParams<DT_X>{false, 0, 0, static_cast<DT_X>(0)});
         }
+        if constexpr (N == 6U) {
+            Duplicate(sum, 0.0F, 64);
+        }
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
@@ -477,13 +480,13 @@ public:
         Columns(mat);
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-            SetVectorMask<float>(kRows * kBatch);
             if constexpr (N == 6U) {
                 Adds<float, false>(sum, sum, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             } else {
+                SetVectorMask<float>(kRows * kBatch);
                 Add<float, false>(sum, sum, cons, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
+                SetVectorMask<float>(64);
             }
-            SetVectorMask<float>(64);
             Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
             Columns(mat);
