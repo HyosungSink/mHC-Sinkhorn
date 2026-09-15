@@ -9,8 +9,9 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t kLanes = 64;       // 8 rows x 8 lanes of fp32
 constexpr uint32_t kRowLanes = 8;     // one 32B data block per padded row
-constexpr float kSettledTail = 3.0e-4F;  // movement still allowed to be left in the loop
+constexpr float kSettledTail = 1.5e-4F;  // movement still allowed to be left in the loop
 constexpr float kMaxRho = 0.999F;     // largest contraction factor treated as geometric
+constexpr float kTailFloor = 0.1F;    // the tail never counts as smaller than this part of a step
 constexpr float kMinContractEps = 1.0e-20F;  // below this the normalization may lose contraction
 constexpr float kNegHuge = -3.0e38F;  // keeps padding lanes out of the row maximum
 
@@ -269,10 +270,10 @@ private:
         // The loop stops on a bounded error argument rather than on a fixed
         // iteration count. One finished iteration moves every lane by at most
         // `move`; if the two most recent iterations shrank by the observed
-        // factor rho, the whole remaining tail is bounded by move*rho/(1-rho).
-        // Leaving once move/(1-rho) is within kSettledTail therefore keeps the
-        // emitted tile within kSettledTail of every later iterate, including the
-        // one the documented schedule would have produced. That argument needs
+        // factor rho, the iterations still to come add at most
+        // move*rho/(1-rho). Leaving once that tail is within kSettledTail keeps
+        // the emitted tile within kSettledTail of every later iterate, including
+        // the one the documented schedule would have produced. That argument needs
         // the normalization to stay contractive, so an eps small enough for
         // normalized entries to underflow keeps the exact requested schedule.
         const bool contractive = tiling_.eps > kMinContractEps;
@@ -292,7 +293,11 @@ private:
                 if (rho > kMaxRho) {
                     rho = kMaxRho;
                 }
-                if (move / (1.0F - rho) <= kSettledTail) {
+                float shrink = rho / (1.0F - rho);
+                if (shrink < kTailFloor) {
+                    shrink = kTailFloor;
+                }
+                if (move * shrink <= kSettledTail) {
                     break;
                 }
             }
