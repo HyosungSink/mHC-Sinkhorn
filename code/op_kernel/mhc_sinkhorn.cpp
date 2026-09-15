@@ -427,10 +427,6 @@ public:
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
-            Duplicate(eps, epsValue, kGroupLanes);
-            SetVectorMask<float>(0ULL, 0xC0C0C0C0C0C0C0C0ULL);
-            Duplicate<float, false>(eps, 0.0F, MASK_PLACEHOLDER, kRepeats, 1, 8);
-            SetVectorMask<float>(64);
             Duplicate(pattern, 0x3F3F3F3FU, 8);
             auto offsets = At<int32_t>(20480);
             Duplicate(offsets, static_cast<int32_t>(0), 64);
@@ -471,7 +467,13 @@ public:
         BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
         Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
         Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
-        Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
+        if constexpr (N == 6U) {
+            SetVectorMask<float>(0ULL, 0x3F3F3F3F3F3F3F3FULL);
+            Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, kRepeats, {1, 1, 8, 8});
+            SetVectorMask<float>(64);
+        } else {
+            Add<float, false>(mat, mat, eps, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
+        }
         Columns(mat);
         if constexpr (N == 6U) {
             if (iterations > 1U) {
