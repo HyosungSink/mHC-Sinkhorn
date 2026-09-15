@@ -540,11 +540,10 @@ class KernelMhcSinkhornNarrowPair {
     __aicore__ inline void Columns(const LocalTensor<float> &mat) {
         auto a = At<float>(1024);
         auto col = At<float>(2048);
+        SetVectorMask<float>(32);
         Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
-        SetVectorMask<float>(16);
         Add<float, false>(col, a, a[8], MASK_PLACEHOLDER, 1, {1, 2, 2, 8, 16, 16});
         Add<float, false>(col, col, At<float>(5120), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
-        SetVectorMask<float>(32);
         Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, 2, {1, 1, 0, 4, 4, 1});
         SetVectorMask<float>(64);
     }
