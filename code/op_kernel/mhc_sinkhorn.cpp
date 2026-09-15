@@ -364,11 +364,11 @@ private:
 
 template <typename DT_X, uint32_t N>
 class KernelMhcSinkhornPair {
-    static constexpr uint32_t kBatch = N == 4U ? 2U : 4U;
+    static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
     static constexpr uint32_t kRows = N == 6U ? 6U : 8U;
     static constexpr uint32_t kRepeats = kRows * kBatch / 8U;
-    static constexpr uint32_t kPairLanes = 2U * kRows * 8U;
+    static constexpr uint32_t kGroupLanes = kBatch * kRows * 8U;
     template <typename U>
     __aicore__ inline LocalTensor<U> At(uint32_t offset) {
         return LocalTensor<U>(TPosition::VECCALC, offset, 2048U / sizeof(U));
@@ -418,7 +418,7 @@ public:
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
         if constexpr (N < 8U) {
-            DataCopyPad(table, tables, DataCopyExtParams{1, (N == 6U ? 168U : 208U) * sizeof(uint32_t), 0, 0, 0},
+            DataCopyPad(table, tables, DataCopyExtParams{1, 336U * sizeof(uint32_t), 0, 0, 0},
                         DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
         }
         if constexpr (sizeof(DT_X) == sizeof(float)) {
@@ -432,9 +432,7 @@ public:
         if constexpr (N < 8U) {
             Duplicate(cons, 1.0F, 8);
             Duplicate(cons, epsValue, N);
-            for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
-                compact.SetValue(252U + pair * 2U * N * N, kNegHuge);
-            }
+            compact.SetValue(252U, kNegHuge);
             Sync<HardEvent::S_V>();
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
@@ -446,9 +444,7 @@ public:
             Cast(input, stage, RoundMode::CAST_NONE, kElements);
         }
         if constexpr (N < 8U) {
-            for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
-                Gather(mat[pair * kPairLanes], compact[pair * 2U * N * N], table, 0, kPairLanes);
-            }
+            Gather(mat, compact, table, 0, kGroupLanes);
         }
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
@@ -486,9 +482,7 @@ public:
             }
         }
         if constexpr (N < 8U) {
-            for (uint32_t pair = 0; pair < kBatch / 2U; ++pair) {
-                Gather(compact[pair * 2U * N * N], mat[pair * kPairLanes], table[kPairLanes], 0, 2U * N * N);
-            }
+            Gather(compact, mat, table[kGroupLanes], 0, kElements);
         }
         auto packed = N < 8U ? compact : mat;
         if constexpr (sizeof(DT_X) == sizeof(float)) {
