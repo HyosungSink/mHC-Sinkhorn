@@ -482,15 +482,10 @@ public:
             Add<float, false>(mat, mat, cons, MASK_PLACEHOLDER, kRepeats, {1, 1, 0, 8, 8, 0});
         }
         Columns(mat);
-        if constexpr (N == 6U) {
-            if (iterations > 1U) {
-                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-            }
+        if (iterations > 1U) {
+            BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
         }
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
-            if constexpr (N != 6U) {
-                BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-            }
             if (!omitSmallEpsilon) {
                 SetVectorMask<float>(kRows * kBatch);
                 if constexpr (N == 6U) {
@@ -511,9 +506,10 @@ public:
                     }
                 }
             } else {
-                if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
+                if (iteration + 1U < iterations) {
                     BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-                    if (RowsSettled<kRows * kBatch>(sum, probe,
+                    if (iteration >= 2U && epsValue > kMinContractEps &&
+                        RowsSettled<kRows * kBatch>(sum, probe,
                         omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
                         break;
                     }
