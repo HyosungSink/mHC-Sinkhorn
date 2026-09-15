@@ -91,12 +91,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     // therefore ask for an octet of blocks and let the idle ones return
     // immediately; larger batches keep one matrix per block up to the core count.
     const uint32_t headBlocks = std::min<uint32_t>(kHeadBlocks, cores);
-    const uint32_t tasks = (matrices + 1U) / 2U;
+    const uint32_t groupMatrices = order == 4U ? 2U : 4U;
+    const uint32_t tasks = (matrices + groupMatrices - 1U) / groupMatrices;
     const uint32_t blockCount = std::min(std::max(tasks, headBlocks), cores);
 
     const uint32_t DT_LOGITS = static_cast<uint32_t>(tensor_x->GetDataType());
-    const uint32_t matricesPerCore = tasks <= cores ? 2U : (matrices + blockCount - 1U) / blockCount;
-    const uint32_t GROUP_ORDER = matricesPerCore == 2U ? order : 0U;
+    const uint32_t matricesPerCore = tasks <= cores ? groupMatrices : (matrices + blockCount - 1U) / blockCount;
+    const uint32_t GROUP_ORDER = matricesPerCore == groupMatrices ? order : 0U;
     ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, GROUP_ORDER);
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
@@ -135,7 +136,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
         const uint32_t row = (slot % 64U) / 8U;
         const uint32_t column = slot % 8U;
         tiling->pairGather[slot] = (row < order && column < order ?
-            batch * order * order + row * order + column : 120U) * sizeof(float);
+            batch * order * order + row * order + column : 252U) * sizeof(float);
     }
     for (uint32_t slot = 0; slot < 80U; ++slot) {
         const uint32_t batch = slot / (order * order);
