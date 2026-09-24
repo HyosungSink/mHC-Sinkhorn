@@ -82,6 +82,13 @@ class KernelMhcSinkhorn {
     static constexpr uint8_t NB2 = static_cast<uint8_t>(2 * N);
     // n=8时 MASK_ALL/MASK_COL 都是全部64个lane, 与Brcb复位后的掩码一致, 无需重设。
     static constexpr bool NEEDS_MASK = (N * mhcs::BLK) < 64;
+    static constexpr uint64_t MASK_FULL = ~0ULL;
+    // 元素计数形式的接口每次调用都要切换掩码模式并写多个状态寄存器, 搬运与建表阶段
+    // 统一改用常驻全掩码的高维切分形式。
+    __aicore__ static inline uint8_t Reps(uint32_t count)
+    {
+        return static_cast<uint8_t>((count + 63) / 64);
+    }
 
 public:
     __aicore__ inline KernelMhcSinkhorn() {}
@@ -142,13 +149,17 @@ public:
         int32_t len = static_cast<int32_t>(mhcs::BLK);
         while (len < total) {
             const int32_t step = (total - len < len) ? (total - len) : len;
-            AscendC::Adds(dst[len], dst, len, step);
+            AscendC::Adds<int32_t, false>(dst[len], dst, len, mhcs::MASK_PH,
+                                          Reps(static_cast<uint32_t>(step)),
+                                          {1, 1, mhcs::BLK, mhcs::BLK});
             len += step;
         }
     }
 
     __aicore__ inline void BuildSpreadTables()
     {
+        AscendC::SetMaskNorm();
+        AscendC::SetVectorMask<float>(0, MASK_FULL);
         uint32_t mats = (count_ < mhcs::CHUNK) ? count_ : mhcs::CHUNK;
         const int32_t spreadCount = static_cast<int32_t>(mats * N * mhcs::BLK);
         const int32_t packCount = static_cast<int32_t>(mats * N * N);
@@ -160,28 +171,38 @@ public:
         // 展开: 目的元素 i 取自紧凑元素 (i>>3)*n + min(i&7, n-1)。
         // 越界lane被钳到本行最后一个元素, 由于主循环掩码只覆盖前 n 个lane, 这些
         // 重复值不参与任何归约或除法。
+        const uint8_t spreadReps = Reps(static_cast<uint32_t>(spreadCount));
+        const AscendC::UnaryRepeatParams up{1, 1, mhcs::BLK, mhcs::BLK};
+        const AscendC::BinaryRepeatParams bp{1, 1, 1, mhcs::BLK, mhcs::BLK, mhcs::BLK};
         BuildIndex(idx, spreadCount);
-        AscendC::ShiftRight(aux, idx, 3, spreadCount);
-        AscendC::ShiftLeft(lo, aux, 3, spreadCount);
-        AscendC::Sub(lo, idx, lo, spreadCount);
-        AscendC::Mins(lo, lo, static_cast<int32_t>(N - 1), spreadCount);
-        AscendC::Muls(aux, aux, static_cast<int32_t>(N), spreadCount);
-        AscendC::Add(lo, lo, aux, spreadCount);
-        AscendC::Muls(lo, lo, static_cast<int32_t>(mhcs::FSZ), spreadCount);
+        AscendC::ShiftRight<int32_t, false>(aux, idx, 3, mhcs::MASK_PH, spreadReps, up);
+        AscendC::ShiftLeft<int32_t, false>(lo, aux, 3, mhcs::MASK_PH, spreadReps, up);
+        AscendC::Sub<int32_t, false>(lo, idx, lo, mhcs::MASK_PH, spreadReps, bp);
+        AscendC::Mins<int32_t, false>(lo, lo, static_cast<int32_t>(N - 1), mhcs::MASK_PH,
+                                      spreadReps, up);
+        AscendC::Muls<int32_t, false>(aux, aux, static_cast<int32_t>(N), mhcs::MASK_PH,
+                                      spreadReps, up);
+        AscendC::Add<int32_t, false>(lo, lo, aux, mhcs::MASK_PH, spreadReps, bp);
+        AscendC::Muls<int32_t, false>(lo, lo, static_cast<int32_t>(mhcs::FSZ), mhcs::MASK_PH,
+                                      spreadReps, up);
 
         // 回收: 紧凑元素 j 取自展开元素 (j/n)*8 + j%n。n=6的整除用乘移实现。
+        const uint8_t packReps = Reps(static_cast<uint32_t>(packCount));
         BuildIndex(idx, packCount);
         if constexpr (N == 4) {
-            AscendC::ShiftRight(aux, idx, 2, packCount);
+            AscendC::ShiftRight<int32_t, false>(aux, idx, 2, mhcs::MASK_PH, packReps, up);
         } else {
-            AscendC::Muls(aux, idx, 43691, packCount);
-            AscendC::ShiftRight(aux, aux, 18, packCount);
+            AscendC::Muls<int32_t, false>(aux, idx, 43691, mhcs::MASK_PH, packReps, up);
+            AscendC::ShiftRight<int32_t, false>(aux, aux, 18, mhcs::MASK_PH, packReps, up);
         }
-        AscendC::Muls(so, aux, static_cast<int32_t>(N), packCount);
-        AscendC::Sub(so, idx, so, packCount);
-        AscendC::Muls(aux, aux, static_cast<int32_t>(mhcs::BLK), packCount);
-        AscendC::Add(so, so, aux, packCount);
-        AscendC::Muls(so, so, static_cast<int32_t>(mhcs::FSZ), packCount);
+        AscendC::Muls<int32_t, false>(so, aux, static_cast<int32_t>(N), mhcs::MASK_PH,
+                                      packReps, up);
+        AscendC::Sub<int32_t, false>(so, idx, so, mhcs::MASK_PH, packReps, bp);
+        AscendC::Muls<int32_t, false>(aux, aux, static_cast<int32_t>(mhcs::BLK), mhcs::MASK_PH,
+                                      packReps, up);
+        AscendC::Add<int32_t, false>(so, so, aux, mhcs::MASK_PH, packReps, bp);
+        AscendC::Muls<int32_t, false>(so, so, static_cast<int32_t>(mhcs::FSZ), mhcs::MASK_PH,
+                                      packReps, up);
         // 地址表由矢量流水写出, 而紧凑搬入由MTE2写同一片UB区域, 需显式定序。
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
@@ -221,8 +242,10 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
         // 只清零折叠指令的预读富余区: 行内padding由DataCopyPad按0填充, 二者互不重叠。
-        AscendC::Duplicate(mat_[cnt * n * mhcs::BLK], 0.0f,
-                           static_cast<int32_t>(mhcs::SLACK * mhcs::BLK));
+        AscendC::SetMaskNorm();
+        AscendC::SetVectorMask<float>(0, MASK_FULL);
+        AscendC::Duplicate<float, false>(mat_[cnt * n * mhcs::BLK], 0.0f, mhcs::MASK_PH,
+                                         Reps(mhcs::SLACK * mhcs::BLK), 1, mhcs::BLK);
 
         if constexpr (PACKED) {
             // n=8时每行恰好占满一个DataBlock, GM上整块连续, 一次搬运即可。
@@ -429,7 +452,8 @@ private:
             AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         if (canCheck) {
-            AscendC::Duplicate(dev_, 0.0f, static_cast<int32_t>(devRep * mhcs::BLK * mhcs::BLK));
+            AscendC::SetVectorMask<float>(0, MASK_FULL);
+            AscendC::Duplicate<float, false>(dev_, 0.0f, mhcs::MASK_PH, devRep, 1, mhcs::BLK);
             AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         ColumnStep<SINGLE>(cnt, rep, repVec);
