@@ -129,6 +129,23 @@ public:
     }
 
     // 展开/回收用的元素地址表, 每次启动构造一次。
+    // 生成 0,1,2,... 序列: 先用标量写出一个DataBlock, 再倍增扩展。
+    // 框架的索引生成接口会通过 TPipe 指针申请事件号, 本算子不建 TPipe, 因此自行构造。
+    __aicore__ inline void BuildIndex(const AscendC::LocalTensor<int32_t> &dst, int32_t total)
+    {
+        for (int32_t i = 0; i < static_cast<int32_t>(mhcs::BLK); ++i) {
+            dst.SetValue(i, i);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+        int32_t len = static_cast<int32_t>(mhcs::BLK);
+        while (len < total) {
+            const int32_t step = (total - len < len) ? (total - len) : len;
+            AscendC::Adds(dst[len], dst, len, step);
+            len += step;
+        }
+    }
+
     __aicore__ inline void BuildSpreadTables()
     {
         uint32_t mats = (count_ < mhcs::CHUNK) ? count_ : mhcs::CHUNK;
@@ -142,7 +159,7 @@ public:
         // 展开: 目的元素 i 取自紧凑元素 (i>>3)*n + min(i&7, n-1)。
         // 越界lane被钳到本行最后一个元素, 由于主循环掩码只覆盖前 n 个lane, 这些
         // 重复值不参与任何归约或除法。
-        AscendC::CreateVecIndex(idx, 0, spreadCount);
+        BuildIndex(idx, spreadCount);
         AscendC::ShiftRight(aux, idx, 3, spreadCount);
         AscendC::ShiftLeft(lo, aux, 3, spreadCount);
         AscendC::Sub(lo, idx, lo, spreadCount);
@@ -152,7 +169,7 @@ public:
         AscendC::Muls(lo, lo, static_cast<int32_t>(mhcs::FSZ), spreadCount);
 
         // 回收: 紧凑元素 j 取自展开元素 (j/n)*8 + j%n。n=6的整除用乘移实现。
-        AscendC::CreateVecIndex(idx, 0, packCount);
+        BuildIndex(idx, packCount);
         if constexpr (N == 4) {
             AscendC::ShiftRight(aux, idx, 2, packCount);
         } else {
