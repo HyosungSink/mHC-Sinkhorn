@@ -14,7 +14,7 @@ constexpr int64_t MAX_ORDER = 8;
 constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元素数溢出uint32
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
-constexpr uint64_t MIN_BLOCKS = 8;
+constexpr uint64_t MIN_BLOCKS = 16;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -100,7 +100,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         perCore = 1;
     }
     uint64_t blocks = (total + perCore - 1) / perCore;
-    // 实测逻辑Block数过少时单次Kernel的固定开销明显更高, 因此对小规模输入补齐到
+    // 实测单次Kernel的固定开销在逻辑Block数约16时最低(2/4个Block明显更慢, 全核启动
+    // 又会显著变慢), 因此对小规模输入把Block数补齐到
     // MIN_BLOCKS个Block, 多余Block在Kernel内直接退出。
     if (blocks < MIN_BLOCKS && coreNum >= MIN_BLOCKS) {
         blocks = MIN_BLOCKS;

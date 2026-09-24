@@ -72,6 +72,8 @@ class KernelMhcSinkhorn {
     static constexpr uint64_t MASK_COL = mhcs::LaneMask(N, N);
     static constexpr uint8_t NB = static_cast<uint8_t>(N);
     static constexpr uint8_t NB2 = static_cast<uint8_t>(2 * N);
+    // n=8时 MASK_ALL/MASK_COL 都是全部64个lane, 与Brcb复位后的掩码一致, 无需重设。
+    static constexpr bool NEEDS_MASK = (N * mhcs::BLK) < 64;
 
 public:
     __aicore__ inline KernelMhcSinkhorn() {}
@@ -282,17 +284,25 @@ private:
                                    {1, 1, 1, NB, NB, mhcs::BLK});
         AscendC::Exp<float, false>(mat_, mat_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
 
-        AscendC::SetVectorMask<float>(0, MASK_ALL);
+        if constexpr (NEEDS_MASK) {
+            AscendC::SetVectorMask<float>(0, MASK_ALL);
+        }
         AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::SetVectorMask<float>(0, MASK_ALL);
+        if constexpr (NEEDS_MASK) {
+            AscendC::SetVectorMask<float>(0, MASK_ALL);
+        }
         AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                    {1, 1, 1, NB, NB, mhcs::BLK});
 
-        AscendC::SetVectorMask<float>(0, MASK_COL);
+        if constexpr (NEEDS_MASK) {
+            AscendC::SetVectorMask<float>(0, MASK_COL);
+        }
         AscendC::Adds<float, false>(mat_, mat_, eps_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
 
-        AscendC::SetVectorMask<float>(0, MASK_ALL);
+        if constexpr (NEEDS_MASK) {
+            AscendC::SetVectorMask<float>(0, MASK_ALL);
+        }
         if (canCheck) {
             AscendC::Duplicate(dev_, 0.0f, static_cast<int32_t>(devRep * mhcs::BLK * mhcs::BLK));
             AscendC::SetVectorMask<float>(0, MASK_ALL);
@@ -301,7 +311,9 @@ private:
         for (uint32_t i = 1; i < iters_; ++i) {
             AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
             AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            if constexpr (NEEDS_MASK) {
+                AscendC::SetVectorMask<float>(0, MASK_ALL);
+            }
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
             if (canCheck && Settled<SINGLE>(rep, devRep)) {
