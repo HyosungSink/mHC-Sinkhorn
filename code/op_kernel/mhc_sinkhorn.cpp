@@ -131,9 +131,6 @@ public:
                                                  mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
         loff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_LOFF * mhcs::FSZ, mhcs::IDX_CAP);
         soff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_SOFF * mhcs::FSZ, mhcs::IDX_CAP);
-        if constexpr (SPREAD) {
-            BuildSpreadTables();
-        }
     }
 
     // 展开/回收用的元素地址表, 每次启动构造一次。
@@ -156,10 +153,9 @@ public:
         }
     }
 
+    // 调用点已把掩码置为常驻全掩码, 这里不再重复设置。
     __aicore__ inline void BuildSpreadTables()
     {
-        AscendC::SetMaskNorm();
-        AscendC::SetVectorMask<float>(0, MASK_FULL);
         uint32_t mats = (count_ < mhcs::CHUNK) ? count_ : mhcs::CHUNK;
         const int32_t spreadCount = static_cast<int32_t>(mats * N * mhcs::BLK);
         const int32_t packCount = static_cast<int32_t>(mats * N * N);
@@ -203,9 +199,6 @@ public:
         AscendC::Add<int32_t, false>(so, so, aux, mhcs::MASK_PH, packReps, bp);
         AscendC::Muls<int32_t, false>(so, so, static_cast<int32_t>(mhcs::FSZ), mhcs::MASK_PH,
                                       packReps, up);
-        // 地址表由矢量流水写出, 而紧凑搬入由MTE2写同一片UB区域, 需显式定序。
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     }
 
     __aicore__ inline void Process()
@@ -279,12 +272,17 @@ private:
             packPad.paddingValue = static_cast<DT_LOGITS>(0.0f);
             if constexpr (IS_FP32) {
                 AscendC::DataCopyPad(t2_, srcGm_[done * elems], packParams, packPad);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             } else {
                 AscendC::DataCopyPad(stage_, srcGm_[done * elems], packParams, packPad);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            }
+            // 地址表与紧凑搬入写的是互不相交的缓冲区, 放在搬运下发之后构造, 表算术
+            // 就在访存延迟的阴影里完成。
+            if (done == 0) {
+                BuildSpreadTables();
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            if constexpr (!IS_FP32) {
                 AscendC::Cast(t2_, stage_, AscendC::RoundMode::CAST_NONE,
                               static_cast<int32_t>(packCount));
             }
@@ -427,7 +425,9 @@ private:
         AscendC::SetVectorMask<float>(0, MASK_COL);
         AscendC::BlockReduceMax<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::SetVectorMask<float>(0, MASK_COL);
+        if constexpr (NEEDS_MASK) {
+            AscendC::SetVectorMask<float>(0, MASK_COL);
+        }
         AscendC::Sub<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                    {1, 1, 1, NB, NB, mhcs::BLK});
         AscendC::Exp<float, false>(mat_, mat_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
@@ -451,10 +451,13 @@ private:
         if constexpr (NEEDS_MASK) {
             AscendC::SetVectorMask<float>(0, MASK_COL);
         }
-        if (canCheck) {
-            AscendC::SetVectorMask<float>(0, MASK_FULL);
-            AscendC::Duplicate<float, false>(dev_, 0.0f, mhcs::MASK_PH, devRep, 1, mhcs::BLK);
-            AscendC::SetVectorMask<float>(0, MASK_COL);
+        if constexpr (!SINGLE) {
+            if (canCheck) {
+                AscendC::SetVectorMask<float>(0, MASK_FULL);
+                AscendC::Duplicate<float, false>(dev_, 0.0f, mhcs::MASK_PH, devRep, 1,
+                                                 mhcs::BLK);
+                AscendC::SetVectorMask<float>(0, MASK_COL);
+            }
         }
         ColumnStep<SINGLE>(cnt, rep, repVec);
         for (uint32_t i = 1; i < iters_; ++i) {
@@ -479,23 +482,31 @@ private:
     template <bool SINGLE>
     __aicore__ inline bool Settled(uint8_t rep, uint8_t devRep)
     {
-        AscendC::Adds<float, false>(dev_, bct_, -1.0f, mhcs::MASK_PH, rep,
-                                    {1, 1, NB, mhcs::BLK});
-        AscendC::Abs<float, false>(dev_, dev_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
         if constexpr (SINGLE) {
-            // 单方阵时偏差恰好占满一个迭代(n*8 <= 64 lane), 一条归约指令即可取到最大值。
-            AscendC::WholeReduceMax<float, false>(res_, dev_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
+            // 因子全部落在 1±TOL 内等价于其极大值与极小值同时落在区间内, 两条归约
+            // 直接读常驻掩码选中的广播因子, 省去做差与取绝对值, 且彼此不构成依赖。
+            AscendC::WholeReduceMax<float, false>(res_, bct_, mhcs::MASK_PH, 1, 1, 1,
+                                                  mhcs::BLK);
+            AscendC::WholeReduceMin<float, false>(mx_, bct_, mhcs::MASK_PH, 1, 1, 1,
+                                                  mhcs::BLK);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            return res_.GetValue(0) < 1.0f + mhcs::CONVERGE_TOL &&
+                   mx_.GetValue(0) > 1.0f - mhcs::CONVERGE_TOL;
         } else {
+            AscendC::Adds<float, false>(dev_, bct_, -1.0f, mhcs::MASK_PH, rep,
+                                        {1, 1, NB, mhcs::BLK});
+            AscendC::Abs<float, false>(dev_, dev_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
             AscendC::SetVectorMask<float>(0, ~0ULL);
             AscendC::BlockReduceMax<float, false>(mx_, dev_, devRep, mhcs::MASK_PH, 1, 1,
                                                   mhcs::BLK);
             AscendC::SetVectorMask<float>(0, mhcs::FullMask(devRep * mhcs::BLK));
             AscendC::WholeReduceMax<float, false>(res_, mx_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
             AscendC::SetVectorMask<float>(0, MASK_COL);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            return res_.GetValue(0) < mhcs::CONVERGE_TOL;
         }
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        return res_.GetValue(0) < mhcs::CONVERGE_TOL;
     }
 
     template <bool SINGLE>
