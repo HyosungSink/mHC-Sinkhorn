@@ -67,11 +67,9 @@ __aicore__ inline uint8_t CeilDiv(uint32_t value, uint32_t divisor)
 
 }  // namespace mhcs
 
-template <typename DT_LOGITS, uint32_t ORDER_SEL, uint32_t SPEC_SEL>
+template <typename DT_LOGITS, uint32_t ORDER_SEL>
 class KernelMhcSinkhorn {
     static constexpr bool FAST = (ORDER_SEL != 0);
-    // 每个Block恰好负责一个方阵时, 源地址只由BlockIdx决定, 与tiling无关。
-    static constexpr bool SPEC = (SPEC_SEL != 0) && FAST;
     static constexpr bool PACKED = (ORDER_SEL == mhcs::MAX_ORDER);
     // 阶数小于8时GM上的行不足一个DataBlock; 整块搬入后用一条Gather展开到按块对齐的
     // 布局, 比逐行下发搬运描述符省下大量访存事务。
@@ -113,32 +111,6 @@ public:
                                                  mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
         loff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_LOFF * mhcs::FSZ, mhcs::IDX_CAP);
         soff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_SOFF * mhcs::FSZ, mhcs::IDX_CAP);
-    }
-
-    // 先下发搬入, 再读tiling: 读取tiling要等一次GM访问返回, 这段延迟就被搬入盖住。
-    __aicore__ inline void SpecIssue(GM_ADDR logits, GM_ADDR weights)
-    {
-        if constexpr (SPEC) {
-            order_ = ORDER_SEL;
-            count_ = 1;
-            constexpr uint64_t elems = static_cast<uint64_t>(N) * N;
-            const uint64_t start = static_cast<uint64_t>(AscendC::GetBlockIdx()) * elems;
-            srcGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(logits) + start);
-            dstGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(weights) + start);
-            SetupBuffers();
-            IssueLoad(0, 1);
-        }
-    }
-
-    __aicore__ inline void SpecRun(const MhcSinkhornTilingData &tiling)
-    {
-        if constexpr (SPEC) {
-            iters_ = tiling.iters;
-            eps_ = tiling.eps;
-            FinishLoad(0, 1);
-            ComputeFast(1);
-            StoreChunk(0, 1);
-        }
     }
 
     __aicore__ inline void Init(GM_ADDR logits, GM_ADDR weights,
@@ -646,22 +618,16 @@ private:
     float eps_ = 0.0f;
 };
 
-template <typename DT_LOGITS, uint32_t ORDER_SEL, uint32_t SPEC_SEL>
+template <typename DT_LOGITS, uint32_t ORDER_SEL>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights,
                                         GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
     AscendC::InitSocState();   // 不再经由TPipe, 这里显式复位与矢量相关的状态寄存器
-    KernelMhcSinkhorn<DT_LOGITS, ORDER_SEL, SPEC_SEL> op;
-    if constexpr ((SPEC_SEL != 0) && (ORDER_SEL != 0)) {
-        op.SpecIssue(logits, weights);
-        GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
-        op.SpecRun(tiling_data);
-    } else {
-        GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
-        op.Init(logits, weights, tiling_data);
-        op.Process();
-    }
+    GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
+    KernelMhcSinkhorn<DT_LOGITS, ORDER_SEL> op;
+    op.Init(logits, weights, tiling_data);
+    op.Process();
 }
 
 // 把生成的入口声明对齐到指令Cache的取指边界。
