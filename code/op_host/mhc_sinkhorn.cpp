@@ -15,7 +15,7 @@ constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元�
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
 constexpr uint64_t TARGET_BLOCKS = 16;
-constexpr uint64_t MAX_PER_BLOCK = 1;
+constexpr uint64_t MAX_PER_BLOCK = 4;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -99,6 +99,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // 有活干的Block数由每个Block至多 MAX_PER_BLOCK 个方阵定出, 逻辑Block数再补齐
     // 到 TARGET_BLOCKS。补齐只影响启动开销, 不能把每个Block的方阵数重新摊薄,
     // 否则 MAX_PER_BLOCK 就失效了。
+    // 每Block多搬几个方阵可以把零散的小突发并成整块搬运。实测5个Mock用例上,
+    // 每Block 1/2/4 个方阵的中位耗时为 3.07/2.67/2.81, 2.82/2.58/2.32,
+    // 2.92/2.82/2.56, 3.06/2.75/2.72, 3.97/3.85/4.03 微秒, 取4整体最优。
     // 启动开销随逻辑Block数变化: 实测空Kernel在16个Block上约1.15微秒, 在8个上
     // 反而约1.26, 在24与40个上升到1.71与2.08, 整算子上的差别同向且更大。
     const uint64_t busy = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
