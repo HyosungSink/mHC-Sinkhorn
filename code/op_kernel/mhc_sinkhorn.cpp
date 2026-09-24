@@ -137,16 +137,16 @@ private:
     {
         const uint32_t n = order_;
         const uint64_t elems = static_cast<uint64_t>(n) * n;
+        if (done != 0) {
+            // 上一块仍在从同一片UB搬出, 清零与搬入都必须等它读完。
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
         // 只清零折叠指令的预读富余区: 行内padding由DataCopyPad按0填充, 二者互不重叠。
         AscendC::Duplicate(mat_[cnt * n * mhcs::BLK], 0.0f,
                            static_cast<int32_t>(mhcs::SLACK * mhcs::BLK));
-        if (done != 0) {
-            // 上一块的搬出必须先于本块的搬入落到同一片UB。
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-        }
 
         if constexpr (PACKED) {
             // n=8时每行恰好占满一个DataBlock, GM上整块连续, 一次搬运即可。
