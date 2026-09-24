@@ -663,3 +663,23 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
         op.Process();
     }
 }
+
+// 把生成的入口声明对齐到指令Cache的取指边界。
+#ifndef cce_kernel
+#define cce_kernel cce_kernel, aligned(2048)
+#endif
+
+// 本算子的UB分区是固定地址, 不经由系统workspace接口, 因此把它替换成空实现,
+// 省掉入口处对全局workspace指针的写入。
+#if (!defined(ASCENDC_CPU_DEBUG) || ASCENDC_CPU_DEBUG == 0) && \
+    !defined(ASCENDC_DUMP) && !defined(ASCENDC_TIME_STAMP_ON) && !defined(ASCENDC_ACC_DUMP)
+namespace AscendC {
+__aicore__ inline void MhcSinkhornInitWorkspace(GM_ADDR) {}
+__aicore__ inline GM_ADDR MhcSinkhornUserWorkspace(GM_ADDR workspace)
+{
+    return workspace + RESERVED_WORKSPACE;
+}
+}  // namespace AscendC
+#define SetSysWorkspaceForce MhcSinkhornInitWorkspace
+#define GetUserWorkspace MhcSinkhornUserWorkspace
+#endif
