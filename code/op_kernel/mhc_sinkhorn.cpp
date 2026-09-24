@@ -362,7 +362,7 @@ private:
     uint32_t iterations_ = 0;
 };
 
-template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true>
+template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true, bool SPECULATE_OUTPUT = false>
 class KernelMhcSinkhornPair {
     static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
@@ -508,7 +508,7 @@ public:
                 }
             } else {
                 if (iteration + 1U < iterations) {
-                    if constexpr (sizeof(DT_X) == sizeof(half)) {
+                    if constexpr (SPECULATE_OUTPUT && sizeof(DT_X) == sizeof(half)) {
                         if (iteration == 2U && epsValue > kMinContractEps) {
                             Cast(output, mat, RoundMode::CAST_NONE, kElements);
                             Sync<HardEvent::V_MTE3>();
@@ -521,7 +521,7 @@ public:
                     if (iteration >= 2U && epsValue > kMinContractEps) {
                         if (RowsSettled<kRows * kBatch>(sum, probe,
                             omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
-                            if constexpr (sizeof(DT_X) == sizeof(half)) {
+                            if constexpr (SPECULATE_OUTPUT && sizeof(DT_X) == sizeof(half)) {
                                 if (iteration == 2U) {
                                     return;
                                 }
@@ -532,7 +532,7 @@ public:
                 }
             }
         }
-        if constexpr (N == 8U && sizeof(DT_X) == sizeof(half)) {
+        if constexpr (SPECULATE_OUTPUT && N == 8U && sizeof(DT_X) == sizeof(half)) {
             if (provisionalOutput) {
                 SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
                 WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
@@ -627,7 +627,6 @@ public:
         Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
         SetVectorMask<float>(64);
         Columns(mat);
-        bool provisionalOutput = false;
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
             SetVectorMask<float>(8);
@@ -637,32 +636,10 @@ public:
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             Columns(mat);
             if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
-                if constexpr (sizeof(DT_X) == sizeof(half)) {
-                    if (iteration == 2U) {
-                        uint64_t selected = 0;
-                        GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
-                        Cast(output, compact, RoundMode::CAST_NONE, 32);
-                        Sync<HardEvent::V_MTE3>();
-                        DataCopy(yGm, output, 32U);
-                        SetVectorMask<float>(64);
-                        provisionalOutput = true;
-                    }
-                }
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
                 if (RowsSettled<8U>(sum, probe)) {
-                    if constexpr (sizeof(DT_X) == sizeof(half)) {
-                        if (iteration == 2U) {
-                            return;
-                        }
-                    }
                     break;
                 }
-            }
-        }
-        if constexpr (sizeof(DT_X) == sizeof(half)) {
-            if (provisionalOutput) {
-                SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
-                WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
             }
         }
         uint64_t selected = 0;
@@ -695,7 +672,10 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
             KernelMhcSinkhornNarrowPair<DT_X> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         } else {
-            KernelMhcSinkhornPair<DT_X, GROUP_ORDER> op;
+            constexpr bool speculateOutput = GROUP_ORDER == 8U &&
+                ACTIVE_GROUPS != 0U && STATIC_ITERATIONS != 0U &&
+                (ACTIVE_GROUPS == 1U || STATIC_ITERATIONS <= 30U);
+            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, speculateOutput> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         }
         PipeBarrier<PIPE_ALL>();
