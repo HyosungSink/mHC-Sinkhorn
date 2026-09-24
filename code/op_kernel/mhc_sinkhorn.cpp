@@ -190,8 +190,7 @@ private:
         uint64_t colMask[2] = {mhcs::LaneMask(n, n), 0};
 
         // --- 初始化: 行方向softmax + eps ---
-        AscendC::ReduceDataBlock<AscendC::ReduceType::MAX, float>(
-            rs_, mat_, colMask, rep, 1, 1, static_cast<int32_t>(n));
+        AscendC::BlockReduceMax<float>(rs_, mat_, rep, colMask, 1, 1, static_cast<int32_t>(n));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
         AscendC::PipeBarrier<PIPE_V>();
@@ -218,8 +217,7 @@ private:
 
     __aicore__ inline void RowSum(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
     {
-        AscendC::ReduceDataBlock<AscendC::ReduceType::SUM, float>(
-            rs_, mat_, fullMask, rep, 1, 1, static_cast<int32_t>(n));
+        AscendC::BlockReduceSum<float>(rs_, mat_, rep, fullMask, 1, 1, static_cast<int32_t>(n));
     }
 
     __aicore__ inline void RowDivide(uint8_t rep, int32_t fullMask, uint32_t n)
