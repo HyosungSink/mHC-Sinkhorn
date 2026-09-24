@@ -14,8 +14,8 @@ constexpr int64_t MAX_ORDER = 8;
 constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元素数溢出uint32
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
-constexpr uint64_t TARGET_BLOCKS = 8;
-constexpr uint64_t MAX_PER_BLOCK = 2;
+constexpr uint64_t TARGET_BLOCKS = 16;
+constexpr uint64_t MAX_PER_BLOCK = 1;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -96,10 +96,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         coreNum = 1;
     }
     const uint64_t total = static_cast<uint64_t>(matrices);
-    // 单次启动的固定开销随逻辑Block数单调上升(实测空Kernel在16/24/40个Block上
-    // 分别约为1.45/1.71/2.08微秒), 但Block数过小又会让每个Block的计算变长。
-    // 因此先按每个Block至多 MAX_PER_BLOCK 个方阵定出Block数, 再夹在
-    // TARGET_BLOCKS 与核数之间。
+    // Block数按每个Block至多 MAX_PER_BLOCK 个方阵定出, 再夹在 TARGET_BLOCKS 与
+    // 核数之间。实测空Kernel在16个Block上约1.15微秒, 在8个上反而约1.26, 在24与
+    // 40个上升到1.71与2.08, 整算子上的差别同向且更大, 因此取16。
     uint64_t blocks = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
     if (blocks < TARGET_BLOCKS) {
         blocks = TARGET_BLOCKS;
