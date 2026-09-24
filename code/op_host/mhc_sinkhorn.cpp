@@ -14,7 +14,8 @@ constexpr int64_t MAX_ORDER = 8;
 constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元素数溢出uint32
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
-constexpr uint64_t MIN_BLOCKS = 16;
+constexpr uint64_t TARGET_BLOCKS = 8;
+constexpr uint64_t MAX_PER_BLOCK = 2;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -95,18 +96,23 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         coreNum = 1;
     }
     const uint64_t total = static_cast<uint64_t>(matrices);
-    // 每个逻辑Block负责一个方阵。把多个方阵并进同一条指令只会提高单条指令的迭代
-    // 数, 依赖链并不变短; 按组分核减少的搬运次数也没有换来更短的整体耗时, 两种
-    // 切分实测相当而分组在阶数6上更差, 因此保持一方阵一Block。
-    uint64_t perCore = (total + coreNum - 1) / coreNum;
+    // 单次启动的固定开销随逻辑Block数单调上升(实测空Kernel在16/24/40个Block上
+    // 分别约为1.45/1.71/2.08微秒), 但Block数过小又会让每个Block的计算变长。
+    // 因此先按每个Block至多 MAX_PER_BLOCK 个方阵定出Block数, 再夹在
+    // TARGET_BLOCKS 与核数之间。
+    uint64_t blocks = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
+    if (blocks < TARGET_BLOCKS) {
+        blocks = TARGET_BLOCKS;
+    }
+    if (blocks > coreNum) {
+        blocks = coreNum;
+    }
+    if (blocks == 0) {
+        blocks = 1;
+    }
+    uint64_t perCore = (total + blocks - 1) / blocks;
     if (perCore == 0) {
         perCore = 1;
-    }
-    uint64_t blocks = (total + perCore - 1) / perCore;
-    // 固定开销随逻辑Block数增长, 但Block数过小时单次启动反而明显更慢; 实测在
-    // MIN_BLOCKS个Block附近最低, 因此对小规模输入补齐到该数, 多余Block直接退出。
-    if (blocks < MIN_BLOCKS && coreNum >= MIN_BLOCKS) {
-        blocks = MIN_BLOCKS;
     }
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();
