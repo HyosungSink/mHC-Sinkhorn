@@ -251,7 +251,10 @@ private:
                 AscendC::DataCopy(stage_, srcGm_[done * elems], elemCount);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::Cast(mat_, stage_, AscendC::RoundMode::CAST_NONE, elemCount);
+                // 一个迭代处理64个元素: 目的按8个DataBlock前进, 源为半精度按4个。
+                AscendC::Cast<float, DT_LOGITS, false>(
+                    mat_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
+                    static_cast<uint8_t>(cnt), {1, 1, mhcs::BLK, mhcs::BLK / 2});
             }
             return;
         }
@@ -283,8 +286,9 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             if constexpr (!IS_FP32) {
-                AscendC::Cast(t2_, stage_, AscendC::RoundMode::CAST_NONE,
-                              static_cast<int32_t>(packCount));
+                AscendC::Cast<float, DT_LOGITS, false>(
+                    t2_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
+                    Reps(packCount), {1, 1, mhcs::BLK, mhcs::BLK / 2});
             }
             AscendC::Gather(mat_, t2_, loff_, 0U, cnt * N * mhcs::BLK);
             return;
@@ -337,7 +341,11 @@ private:
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::DataCopy(dstGm_[done * elems], mat_, elemCount);
             } else {
-                AscendC::Cast(stage_, mat_, AscendC::RoundMode::CAST_RINT, elemCount);
+                AscendC::SetMaskNorm();
+                AscendC::SetVectorMask<float>(0, MASK_FULL);
+                AscendC::Cast<DT_LOGITS, float, false>(
+                    stage_, mat_, AscendC::RoundMode::CAST_RINT, mhcs::MASK_PH,
+                    static_cast<uint8_t>(cnt), {1, 1, mhcs::BLK / 2, mhcs::BLK});
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::DataCopy(dstGm_[done * elems], stage_, elemCount);
@@ -349,8 +357,11 @@ private:
             const uint32_t packCount = cnt * N * N;
             AscendC::Gather(t2_, mat_, soff_, 0U, packCount);
             if constexpr (!IS_FP32) {
-                AscendC::Cast(stage_, t2_, AscendC::RoundMode::CAST_RINT,
-                              static_cast<int32_t>(packCount));
+                AscendC::SetMaskNorm();
+                AscendC::SetVectorMask<float>(0, MASK_FULL);
+                AscendC::Cast<DT_LOGITS, float, false>(
+                    stage_, t2_, AscendC::RoundMode::CAST_RINT, mhcs::MASK_PH,
+                    Reps(packCount), {1, 1, mhcs::BLK / 2, mhcs::BLK});
             }
             AscendC::DataCopyExtParams packParams;
             packParams.blockCount = 1;
