@@ -253,11 +253,24 @@ private:
     // 列方向折叠改用DataBlock步长成对相加, 从而与行方向共享同一掩码。
     __aicore__ inline void ComputeFast(uint32_t cnt)
     {
-        const uint8_t rep = static_cast<uint8_t>(cnt);
-        const uint8_t repVec = mhcs::CeilDiv(cnt, N);
-        const uint32_t devBlocks = cnt * N;
-        const bool canCheck = devBlocks <= 64;
-        const uint8_t devRep = mhcs::CeilDiv(devBlocks, mhcs::BLK);
+        // 单方阵是最常见的分核结果; 为它单独实例化一份, 所有迭代次数都成为立即数,
+        // 指令不再需要通过标量寄存器下发迭代配置。
+        if (cnt == 1) {
+            ComputeFastImpl<true>(1);
+        } else {
+            ComputeFastImpl<false>(cnt);
+        }
+    }
+
+    template <bool SINGLE>
+    __aicore__ inline void ComputeFastImpl(uint32_t cnt)
+    {
+        const uint8_t rep = SINGLE ? uint8_t{1} : static_cast<uint8_t>(cnt);
+        const uint8_t repVec = SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, N);
+        const uint32_t devBlocks = SINGLE ? N : cnt * N;
+        const bool canCheck = SINGLE ? true : (devBlocks <= 64);
+        const uint8_t devRep = SINGLE ? uint8_t{(N + mhcs::BLK - 1) / mhcs::BLK}
+                                      : mhcs::CeilDiv(devBlocks, mhcs::BLK);
 
         AscendC::SetMaskNorm();
         AscendC::SetVectorMask<float>(0, MASK_COL);
@@ -283,24 +296,25 @@ private:
             AscendC::Duplicate(dev_, 0.0f, static_cast<int32_t>(devRep * mhcs::BLK * mhcs::BLK));
             AscendC::SetVectorMask<float>(0, MASK_ALL);
         }
-        ColumnStep(cnt, rep, repVec);
+        ColumnStep<SINGLE>(cnt, rep, repVec);
         for (uint32_t i = 1; i < iters_; ++i) {
             AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
             AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
             AscendC::SetVectorMask<float>(0, MASK_ALL);
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
-            if (canCheck && (i % mhcs::CHECK_STRIDE) == 0 && Settled(rep, devRep)) {
+            if (canCheck && (i % mhcs::CHECK_STRIDE) == 0 && Settled<SINGLE>(rep, devRep)) {
                 break;
             }
             AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                        {1, 1, 1, NB, NB, mhcs::BLK});
-            ColumnStep(cnt, rep, repVec);
+            ColumnStep<SINGLE>(cnt, rep, repVec);
         }
         AscendC::ResetMask();
     }
 
     // 归一化因子是否已停在1附近: 此时本次及其后的迭代都不再改变结果。
+    template <bool SINGLE>
     __aicore__ inline bool Settled(uint8_t rep, uint8_t devRep)
     {
         AscendC::Adds<float, false>(dev_, bct_, -1.0f, mhcs::MASK_PH, rep,
@@ -308,7 +322,8 @@ private:
         AscendC::Abs<float, false>(dev_, dev_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
         AscendC::SetVectorMask<float>(0, ~0ULL);
         AscendC::BlockReduceMax<float, false>(mx_, dev_, devRep, mhcs::MASK_PH, 1, 1, mhcs::BLK);
-        AscendC::SetVectorMask<float>(0, mhcs::FullMask(devRep * mhcs::BLK));
+        AscendC::SetVectorMask<float>(0, SINGLE ? mhcs::FullMask(
+            ((N + mhcs::BLK - 1) / mhcs::BLK) * mhcs::BLK) : mhcs::FullMask(devRep * mhcs::BLK));
         AscendC::WholeReduceMax<float, false>(res_, mx_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
@@ -317,28 +332,29 @@ private:
         return worst < mhcs::CONVERGE_TOL;
     }
 
+    template <bool SINGLE>
     __aicore__ inline void ColumnStep(uint32_t cnt, uint8_t rep, uint8_t repVec)
     {
         // 成对折叠: 每条指令用DataBlock步长2把相邻两块相加, 掩码保持 n*8 lane。
         if constexpr (ORDER_SEL == 8) {
             AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 2)), {1, 2, 2, NB, NB2, NB2});
             AscendC::Add<float, false>(t2_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 4), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 4)), {1, 2, 2, NB, NB2, NB2});
             AscendC::Add<float, false>(cs_, t2_, t2_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 8), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 8)), {1, 2, 2, NB, NB2, NB2});
         } else if constexpr (ORDER_SEL == 6) {
             AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 2)), {1, 2, 2, NB, NB2, NB2});
             AscendC::Add<float, false>(t2_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 6), {1, 3, 3, NB, 18, 18});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 6)), {1, 3, 3, NB, 18, 18});
             AscendC::Add<float, false>(cs_, t2_, t1_[2 * mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 6), {1, 1, 3, NB, NB, 18});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 6)), {1, 1, 3, NB, NB, 18});
         } else {
             AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 2)), {1, 2, 2, NB, NB2, NB2});
             AscendC::Add<float, false>(cs_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
-                                       mhcs::CeilDiv(cnt, 4), {1, 2, 2, NB, NB2, NB2});
+                                       (SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, 4)), {1, 2, 2, NB, NB2, NB2});
         }
         AscendC::Adds<float, false>(cs_, cs_, eps_, mhcs::MASK_PH, repVec, {1, 1, NB, NB});
         AscendC::Div<float, false>(mat_, mat_, cs_, mhcs::MASK_PH, rep,
