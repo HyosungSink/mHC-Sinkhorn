@@ -96,12 +96,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         coreNum = 1;
     }
     const uint64_t total = static_cast<uint64_t>(matrices);
-    // Block数按每个Block至多 MAX_PER_BLOCK 个方阵定出, 再夹在 TARGET_BLOCKS 与
-    // 核数之间。实测空Kernel在16个Block上约1.15微秒, 在8个上反而约1.26, 在24与
-    // 40个上升到1.71与2.08, 整算子上的差别同向且更大, 因此取16。
-    // 有活干的Block数由每个Block至多 MAX_PER_BLOCK 个方阵定出; 逻辑Block数再补齐
-    // 到 TARGET_BLOCKS。补齐只影响启动, 不能把每个Block的方阵数重新摊薄, 否则
-    // MAX_PER_BLOCK 就失效了。
+    // 有活干的Block数由每个Block至多 MAX_PER_BLOCK 个方阵定出, 逻辑Block数再补齐
+    // 到 TARGET_BLOCKS。补齐只影响启动开销, 不能把每个Block的方阵数重新摊薄,
+    // 否则 MAX_PER_BLOCK 就失效了。
+    // 启动开销随逻辑Block数变化: 实测空Kernel在16个Block上约1.15微秒, 在8个上
+    // 反而约1.26, 在24与40个上升到1.71与2.08, 整算子上的差别同向且更大。
     const uint64_t busy = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
     uint64_t blocks = (busy < TARGET_BLOCKS) ? TARGET_BLOCKS : busy;
     if (blocks > coreNum) {
