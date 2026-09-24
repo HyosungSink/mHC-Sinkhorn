@@ -12,6 +12,7 @@ constexpr uint32_t CHUNK = 64;         // 单轮驻留UB的方阵数上限
 constexpr uint32_t MAX_REPEAT = 255;   // 单条矢量指令的最大迭代数
 constexpr uint32_t SLACK = 2 * MAX_ORDER;  // 折叠指令跨迭代预读的富余DataBlock数
 constexpr int32_t MASK_PH = 0;         // isSetMask=false 时的掩码占位值
+constexpr uint32_t FSZ = sizeof(float);
 
 // 收敛判据: 当所有归一化因子与1的偏差小于该阈值时, 后续迭代对结果的改变
 // 已远小于数值容差, 迭代随即结束。判据在每次迭代中评估。
@@ -100,18 +101,20 @@ public:
         srcGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(logits) + start * elems);
         dstGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(weights) + start * elems);
 
-        pipe_.InitBuffer(buf_, mhcs::UB_FLOATS * sizeof(float));
-        AscendC::LocalTensor<float> base = buf_.Get<float>();
-        mat_ = base[mhcs::OFF_MAT];
-        bct_ = base[mhcs::OFF_BCT];
-        t1_ = base[mhcs::OFF_T1];
-        t2_ = base[mhcs::OFF_T2];
-        dev_ = base[mhcs::OFF_DEV];
-        rs_ = base[mhcs::OFF_RS];
-        cs_ = base[mhcs::OFF_CS];
-        mx_ = base[mhcs::OFF_MX];
-        res_ = base[mhcs::OFF_RES];
-        stage_ = base[mhcs::OFF_STG].template ReinterpretCast<DT_LOGITS>();
+        // 分区固定且互不重叠, 直接按UB地址构造张量; TPipe的缓冲池记账与析构时的
+        // 全流水栅栏在本算子里没有对应收益。
+        constexpr AscendC::TPosition POS = AscendC::TPosition::VECCALC;
+        mat_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MAT * mhcs::FSZ, mhcs::MAT_CAP);
+        bct_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_BCT * mhcs::FSZ, mhcs::BCT_CAP);
+        t1_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T1 * mhcs::FSZ, mhcs::MAT_CAP);
+        t2_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T2 * mhcs::FSZ, mhcs::MAT_CAP);
+        dev_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_DEV * mhcs::FSZ, mhcs::MAT_CAP);
+        rs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RS * mhcs::FSZ, mhcs::VEC_CAP);
+        cs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_CS * mhcs::FSZ, mhcs::VEC_CAP);
+        mx_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MX * mhcs::FSZ, mhcs::VEC_CAP);
+        res_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RES * mhcs::FSZ, mhcs::BLK);
+        stage_ = AscendC::LocalTensor<DT_LOGITS>(POS, mhcs::OFF_STG * mhcs::FSZ,
+                                                 mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
     }
 
     __aicore__ inline void Process()
@@ -418,8 +421,6 @@ private:
         AscendC::Div(mat_, mat_, cs_, span, rep, {1, 1, 0, stride, stride, 1});
     }
 
-    AscendC::TPipe pipe_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> buf_;
     AscendC::GlobalTensor<DT_LOGITS> srcGm_;
     AscendC::GlobalTensor<DT_LOGITS> dstGm_;
     AscendC::LocalTensor<float> mat_;
@@ -443,6 +444,7 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
                                         GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
+    AscendC::InitSocState();   // 不再经由TPipe, 这里显式复位与矢量相关的状态寄存器
     GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
     KernelMhcSinkhorn<DT_LOGITS, ORDER_SEL> op;
     op.Init(logits, weights, tiling_data);
