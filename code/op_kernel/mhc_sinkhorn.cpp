@@ -153,9 +153,10 @@ public:
         }
     }
 
-    // 调用点已把掩码置为常驻全掩码, 这里不再重复设置。
     __aicore__ inline void BuildSpreadTables()
     {
+        AscendC::SetMaskNorm();
+        AscendC::SetVectorMask<float>(0, MASK_FULL);
         uint32_t mats = (count_ < mhcs::CHUNK) ? count_ : mhcs::CHUNK;
         const int32_t spreadCount = static_cast<int32_t>(mats * N * mhcs::BLK);
         const int32_t packCount = static_cast<int32_t>(mats * N * N);
@@ -234,12 +235,8 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
-        // 只清零折叠指令的预读富余区: 行内padding由DataCopyPad按0填充, 二者互不重叠。
-        AscendC::SetMaskNorm();
-        AscendC::SetVectorMask<float>(0, MASK_FULL);
-        AscendC::Duplicate<float, false>(mat_[cnt * n * mhcs::BLK], 0.0f, mhcs::MASK_PH,
-                                         Reps(mhcs::SLACK * mhcs::BLK), 1, mhcs::BLK);
-
+        // 折叠指令按DataBlock步长预读到方阵之后的富余区, 但那些lane只会落进列和
+        // 向量里本轮用不到的DataBlock, 除法每个迭代只取第一块, 因此无需清零。
         if constexpr (PACKED) {
             // n=8时每行恰好占满一个DataBlock, GM上整块连续, 一次搬运即可。
             const int32_t elemCount = static_cast<int32_t>(cnt * mhcs::MAX_ORDER * mhcs::BLK);
@@ -251,6 +248,8 @@ private:
                 AscendC::DataCopy(stage_, srcGm_[done * elems], elemCount);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::SetMaskNorm();
+                AscendC::SetVectorMask<float>(0, MASK_FULL);
                 // 一个迭代处理64个元素: 目的按8个DataBlock前进, 源为半精度按4个。
                 AscendC::Cast<float, DT_LOGITS, false>(
                     mat_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
@@ -286,6 +285,8 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             if constexpr (!IS_FP32) {
+                AscendC::SetMaskNorm();
+                AscendC::SetVectorMask<float>(0, MASK_FULL);
                 AscendC::Cast<float, DT_LOGITS, false>(
                     t2_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
                     Reps(packCount), {1, 1, mhcs::BLK, mhcs::BLK / 2});
