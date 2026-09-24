@@ -501,8 +501,24 @@ public:
             Columns(mat, !omitSmallEpsilon);
             if constexpr (N == 6U) {
                 if (iteration + 1U < iterations) {
+                    if constexpr (sizeof(DT_X) == sizeof(half)) {
+                        if (iteration == 3U && epsValue > kMinContractEps) {
+                            uint64_t selected = 0;
+                            GatherMask(compact, mat, pattern, true, 64, {1, kRepeats, 8, 0}, selected);
+                            Cast(output, compact, RoundMode::CAST_NONE, kElements);
+                            Sync<HardEvent::V_MTE3>();
+                            DataCopy(yGm, output, kElements);
+                            SetVectorMask<float>(64);
+                            provisionalOutput = true;
+                        }
+                    }
                     BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
                     if (iteration >= 2U && epsValue > kMinContractEps && RowsSettled<kRows * kBatch>(sum, probe)) {
+                        if constexpr (sizeof(DT_X) == sizeof(half)) {
+                            if (iteration == 3U) {
+                                return;
+                            }
+                        }
                         break;
                     }
                 }
@@ -532,7 +548,7 @@ public:
                 }
             }
         }
-        if constexpr (SPECULATE_OUTPUT && N == 8U && sizeof(DT_X) == sizeof(half)) {
+        if constexpr ((N == 6U || (SPECULATE_OUTPUT && N == 8U)) && sizeof(DT_X) == sizeof(half)) {
             if (provisionalOutput) {
                 SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
                 WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
