@@ -77,22 +77,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     if (!(eps >= -1.0e38F && eps <= 1.0e38F)) {
         return ge::GRAPH_FAILED;
     }
-    const auto &probeShape = tensor_x->GetOriginShape();
-    const bool probeMatch = probeShape.GetDimNum() == 4 &&
-        ((probeShape.GetDim(0) == 1 && probeShape.GetDim(1) == 2 &&
-          probeShape.GetDim(2) == 4 && probeShape.GetDim(3) == 4 && iterations == 30) ||
-         (probeShape.GetDim(0) == 1 && probeShape.GetDim(1) == 4 &&
-          probeShape.GetDim(2) == 8 && probeShape.GetDim(3) == 8 && iterations == 50) ||
-         (probeShape.GetDim(0) == 1 && probeShape.GetDim(1) == 8 &&
-          probeShape.GetDim(2) == 8 && probeShape.GetDim(3) == 8 && iterations == 20) ||
-         (probeShape.GetDim(0) == 2 && probeShape.GetDim(1) == 4 &&
-          probeShape.GetDim(2) == 8 && probeShape.GetDim(3) == 8 && iterations == 50) ||
-         (probeShape.GetDim(0) == 1 && probeShape.GetDim(1) == 16 &&
-          probeShape.GetDim(2) == 6 && probeShape.GetDim(3) == 6 && iterations == 100));
-    if (tensor_x->GetDataType() != ge::DT_FLOAT16 || eps != 1.0e-6F || !probeMatch) {
-        return ge::GRAPH_FAILED;
-    }
-
     const auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t order = static_cast<uint32_t>(tensor_x->GetOriginShape().GetDim(
         static_cast<int32_t>(tensor_x->GetOriginShape().GetDimNum()) - 1));

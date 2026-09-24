@@ -135,7 +135,7 @@ private:
         LocalTensor<float> mat = At<float>(kOffMat);
         const uint64_t offset = static_cast<uint64_t>(matrix) * n_ * n_;
         // The previous store reads the tile and the previous compute reads the
-        // staging buffers, so both must retire before this load overwrites them.
+        // staging buffers, so both must retire before this load reuses them.
         Sync<HardEvent::MTE3_MTE2>();
         Sync<HardEvent::V_MTE2>();
         // An 8x8 matrix already fills the padded tile with no gaps, so the whole
@@ -206,7 +206,7 @@ private:
             DataCopyPad(yGm_[offset], stage, copy);
         } else {
             // The narrow path mirrors the load: one indexed copy packs the rows
-            // back to back, one cast narrows them, one burst writes them out.
+            // back to back, one cast narrows them, one burst stores them.
             LocalTensor<DT_X> stage = At<DT_X>(kOffOut);
             LocalTensor<float> compact = At<float>(kOffCompact);
             Sync<HardEvent::MTE3_V>();
@@ -485,6 +485,7 @@ public:
         if (iterations > 1U) {
             BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
         }
+        bool provisionalOutput = false;
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             if (!omitSmallEpsilon) {
                 SetVectorMask<float>(kRows * kBatch);
@@ -507,13 +508,34 @@ public:
                 }
             } else {
                 if (iteration + 1U < iterations) {
+                    if constexpr (sizeof(DT_X) == sizeof(half)) {
+                        if (iteration == 2U && epsValue > kMinContractEps) {
+                            Cast(output, mat, RoundMode::CAST_NONE, kElements);
+                            Sync<HardEvent::V_MTE3>();
+                            DataCopy(yGm, output, kElements);
+                            SetVectorMask<float>(64);
+                            provisionalOutput = true;
+                        }
+                    }
                     BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-                    if (iteration >= 2U && epsValue > kMinContractEps &&
-                        RowsSettled<kRows * kBatch>(sum, probe,
-                        omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
-                        break;
+                    if (iteration >= 2U && epsValue > kMinContractEps) {
+                        if (RowsSettled<kRows * kBatch>(sum, probe,
+                            omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
+                            if constexpr (sizeof(DT_X) == sizeof(half)) {
+                                if (iteration == 2U) {
+                                    return;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
+            }
+        }
+        if constexpr (N == 8U && sizeof(DT_X) == sizeof(half)) {
+            if (provisionalOutput) {
+                SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
+                WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
             }
         }
         if constexpr (N < 8U) {
@@ -605,6 +627,7 @@ public:
         Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
         SetVectorMask<float>(64);
         Columns(mat);
+        bool provisionalOutput = false;
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
             SetVectorMask<float>(8);
@@ -614,10 +637,32 @@ public:
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             Columns(mat);
             if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
+                if constexpr (sizeof(DT_X) == sizeof(half)) {
+                    if (iteration == 2U) {
+                        uint64_t selected = 0;
+                        GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
+                        Cast(output, compact, RoundMode::CAST_NONE, 32);
+                        Sync<HardEvent::V_MTE3>();
+                        DataCopy(yGm, output, 32U);
+                        SetVectorMask<float>(64);
+                        provisionalOutput = true;
+                    }
+                }
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
                 if (RowsSettled<8U>(sum, probe)) {
+                    if constexpr (sizeof(DT_X) == sizeof(half)) {
+                        if (iteration == 2U) {
+                            return;
+                        }
+                    }
                     break;
                 }
+            }
+        }
+        if constexpr (sizeof(DT_X) == sizeof(half)) {
+            if (provisionalOutput) {
+                SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
+                WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
             }
         }
         uint64_t selected = 0;
