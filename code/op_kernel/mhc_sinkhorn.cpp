@@ -125,8 +125,10 @@ private:
     {
         const uint32_t n = order_;
         const uint64_t elems = static_cast<uint64_t>(n) * n;
-        // 清零工作区与折叠指令的预读富余区, 保证结果与残留lane无关。
-        AscendC::Duplicate(mat_, 0.0f, static_cast<int32_t>((cnt * n + mhcs::SLACK) * mhcs::BLK));
+        // 只清零折叠指令的预读富余区: 行内padding由DataCopyPad按0填充, 二者互不重叠,
+        // 因此矢量清零与MTE2搬入之间不存在写-写竞争。
+        AscendC::Duplicate(mat_[cnt * n * mhcs::BLK], 0.0f,
+                           static_cast<int32_t>(mhcs::SLACK * mhcs::BLK));
 
         AscendC::DataCopyExtParams copyParams;
         copyParams.blockCount = static_cast<uint16_t>(cnt * n);
@@ -195,6 +197,8 @@ private:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     }
 
     // ------------------------------------------------ 特化路径: 掩码常驻矢量寄存器
@@ -206,9 +210,11 @@ private:
         const uint8_t rep = static_cast<uint8_t>(cnt);
         const uint8_t repVec = mhcs::CeilDiv(cnt, N);
 
+        AscendC::SetMaskNorm();
         AscendC::SetVectorMask<float>(0, MASK_COL);
         AscendC::BlockReduceMax<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
-        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});   // Brcb内部会复位掩码寄存器
+        AscendC::SetVectorMask<float>(0, MASK_COL);
         AscendC::Sub<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                    {1, 1, 1, NB, NB, mhcs::BLK});
         AscendC::Exp<float, false>(mat_, mat_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
@@ -216,6 +222,7 @@ private:
         AscendC::SetVectorMask<float>(0, MASK_ALL);
         AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+        AscendC::SetVectorMask<float>(0, MASK_ALL);
         AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                    {1, 1, 1, NB, NB, mhcs::BLK});
 
@@ -226,8 +233,10 @@ private:
         ColumnStep(cnt, rep, repVec);
         for (uint32_t i = 1; i < iters_; ++i) {
             AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
-            AscendC::Adds<float, false>(rs_, rs_, eps_, mhcs::MASK_PH, repVec, {1, 1, NB, NB});
             AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
+                                        {1, 1, mhcs::BLK, mhcs::BLK});
             AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                        {1, 1, 1, NB, NB, mhcs::BLK});
             ColumnStep(cnt, rep, repVec);
