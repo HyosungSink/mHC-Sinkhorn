@@ -30,7 +30,7 @@ constexpr uint32_t STG_CAP = CHUNK * MAX_ORDER * 2 * BLK;   // 半精度落地�
 constexpr uint32_t UB_FLOATS = OFF_STG + STG_CAP;
 
 // 每个DataBlock内前 n 个lane置位、共 blocks 个DataBlock的逐bit掩码。
-constexpr uint64_t LaneMask(uint32_t n, uint32_t blocks)
+__aicore__ inline constexpr uint64_t LaneMask(uint32_t n, uint32_t blocks)
 {
     uint64_t lane = (n >= BLK) ? 0xFFULL : ((1ULL << n) - 1ULL);
     uint64_t value = 0;
@@ -41,7 +41,7 @@ constexpr uint64_t LaneMask(uint32_t n, uint32_t blocks)
 }
 
 // 前 lanes 个lane全部置位的连续掩码。
-constexpr uint64_t FullMask(uint32_t lanes)
+__aicore__ inline constexpr uint64_t FullMask(uint32_t lanes)
 {
     return (lanes >= 64) ? ~0ULL : ((1ULL << lanes) - 1ULL);
 }
