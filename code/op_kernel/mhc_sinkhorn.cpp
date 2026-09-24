@@ -67,9 +67,11 @@ __aicore__ inline uint8_t CeilDiv(uint32_t value, uint32_t divisor)
 
 }  // namespace mhcs
 
-template <typename DT_LOGITS, uint32_t ORDER_SEL>
+template <typename DT_LOGITS, uint32_t ORDER_SEL, uint32_t SPEC_SEL>
 class KernelMhcSinkhorn {
     static constexpr bool FAST = (ORDER_SEL != 0);
+    // 每个Block恰好负责一个方阵时, 源地址只由BlockIdx决定, 与tiling无关。
+    static constexpr bool SPEC = (SPEC_SEL != 0) && FAST;
     static constexpr bool PACKED = (ORDER_SEL == mhcs::MAX_ORDER);
     // 阶数小于8时GM上的行不足一个DataBlock; 整块搬入后用一条Gather展开到按块对齐的
     // 布局, 比逐行下发搬运描述符省下大量访存事务。
@@ -93,6 +95,52 @@ class KernelMhcSinkhorn {
 public:
     __aicore__ inline KernelMhcSinkhorn() {}
 
+    // UB分区固定且互不重叠, 直接按地址构造张量; TPipe的缓冲池记账与析构时的全流水
+    // 栅栏在本算子里没有对应收益。这一步不读tiling, 可以排在tiling之前。
+    __aicore__ inline void SetupBuffers()
+    {
+        constexpr AscendC::TPosition POS = AscendC::TPosition::VECCALC;
+        mat_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MAT * mhcs::FSZ, mhcs::MAT_CAP);
+        bct_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_BCT * mhcs::FSZ, mhcs::BCT_CAP);
+        t1_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T1 * mhcs::FSZ, mhcs::MAT_CAP);
+        t2_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T2 * mhcs::FSZ, mhcs::MAT_CAP);
+        dev_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_DEV * mhcs::FSZ, mhcs::MAT_CAP);
+        rs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RS * mhcs::FSZ, mhcs::VEC_CAP);
+        cs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_CS * mhcs::FSZ, mhcs::VEC_CAP);
+        mx_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MX * mhcs::FSZ, mhcs::VEC_CAP);
+        res_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RES * mhcs::FSZ, mhcs::BLK);
+        stage_ = AscendC::LocalTensor<DT_LOGITS>(POS, mhcs::OFF_STG * mhcs::FSZ,
+                                                 mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
+        loff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_LOFF * mhcs::FSZ, mhcs::IDX_CAP);
+        soff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_SOFF * mhcs::FSZ, mhcs::IDX_CAP);
+    }
+
+    // 先下发搬入, 再读tiling: 读取tiling要等一次GM访问返回, 这段延迟就被搬入盖住。
+    __aicore__ inline void SpecIssue(GM_ADDR logits, GM_ADDR weights)
+    {
+        if constexpr (SPEC) {
+            order_ = ORDER_SEL;
+            count_ = 1;
+            constexpr uint64_t elems = static_cast<uint64_t>(N) * N;
+            const uint64_t start = static_cast<uint64_t>(AscendC::GetBlockIdx()) * elems;
+            srcGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(logits) + start);
+            dstGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(weights) + start);
+            SetupBuffers();
+            IssueLoad(0, 1);
+        }
+    }
+
+    __aicore__ inline void SpecRun(const MhcSinkhornTilingData &tiling)
+    {
+        if constexpr (SPEC) {
+            iters_ = tiling.iters;
+            eps_ = tiling.eps;
+            FinishLoad(0, 1);
+            ComputeFast(1);
+            StoreChunk(0, 1);
+        }
+    }
+
     __aicore__ inline void Init(GM_ADDR logits, GM_ADDR weights,
                                 const MhcSinkhornTilingData &tiling)
     {
@@ -114,23 +162,7 @@ public:
         const uint64_t elems = static_cast<uint64_t>(order_) * order_;
         srcGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(logits) + start * elems);
         dstGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DT_LOGITS *>(weights) + start * elems);
-
-        // 分区固定且互不重叠, 直接按UB地址构造张量; TPipe的缓冲池记账与析构时的
-        // 全流水栅栏在本算子里没有对应收益。
-        constexpr AscendC::TPosition POS = AscendC::TPosition::VECCALC;
-        mat_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MAT * mhcs::FSZ, mhcs::MAT_CAP);
-        bct_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_BCT * mhcs::FSZ, mhcs::BCT_CAP);
-        t1_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T1 * mhcs::FSZ, mhcs::MAT_CAP);
-        t2_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_T2 * mhcs::FSZ, mhcs::MAT_CAP);
-        dev_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_DEV * mhcs::FSZ, mhcs::MAT_CAP);
-        rs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RS * mhcs::FSZ, mhcs::VEC_CAP);
-        cs_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_CS * mhcs::FSZ, mhcs::VEC_CAP);
-        mx_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_MX * mhcs::FSZ, mhcs::VEC_CAP);
-        res_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RES * mhcs::FSZ, mhcs::BLK);
-        stage_ = AscendC::LocalTensor<DT_LOGITS>(POS, mhcs::OFF_STG * mhcs::FSZ,
-                                                 mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
-        loff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_LOFF * mhcs::FSZ, mhcs::IDX_CAP);
-        soff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_SOFF * mhcs::FSZ, mhcs::IDX_CAP);
+        SetupBuffers();
     }
 
     // 展开/回收用的元素地址表, 每次启动构造一次。
@@ -212,7 +244,8 @@ public:
             if (cnt > mhcs::CHUNK) {
                 cnt = mhcs::CHUNK;
             }
-            LoadChunk(done, cnt);
+            IssueLoad(done, cnt);
+            FinishLoad(done, cnt);
             if constexpr (FAST) {
                 ComputeFast(cnt);
             } else {
@@ -224,46 +257,34 @@ public:
 
 private:
     // ---------------------------------------------------------------- 数据搬入
-    __aicore__ inline void LoadChunk(uint32_t done, uint32_t cnt)
+    // 搬入拆成"下发"与"收尾"两半: 下发只需要源地址与长度, 收尾才需要等待访存返回。
+    // 分开之后, 下发可以排在任何仍未就绪的标量读取之前。
+    __aicore__ inline void IssueLoad(uint32_t done, uint32_t cnt)
     {
         const uint32_t n = order_;
         const uint64_t elems = static_cast<uint64_t>(n) * n;
         if (done != 0) {
-            // 上一块仍在从同一片UB搬出, 清零与搬入都必须等它读完。
+            // 上一块仍在从同一片UB搬出, 本块的写入必须等它读完。
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
-        // 折叠指令按DataBlock步长预读到方阵之后的富余区, 但那些lane只会落进列和
-        // 向量里本轮用不到的DataBlock, 除法每个迭代只取第一块, 因此无需清零。
         if constexpr (PACKED) {
             // n=8时每行恰好占满一个DataBlock, GM上整块连续, 一次搬运即可。
             const int32_t elemCount = static_cast<int32_t>(cnt * mhcs::MAX_ORDER * mhcs::BLK);
             if constexpr (IS_FP32) {
                 AscendC::DataCopy(mat_, srcGm_[done * elems], elemCount);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             } else {
                 AscendC::DataCopy(stage_, srcGm_[done * elems], elemCount);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-                AscendC::SetMaskNorm();
-                AscendC::SetVectorMask<float>(0, MASK_FULL);
-                // 一个迭代处理64个元素: 目的按8个DataBlock前进, 源为半精度按4个。
-                AscendC::Cast<float, DT_LOGITS, false>(
-                    mat_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
-                    static_cast<uint8_t>(cnt), {1, 1, mhcs::BLK, mhcs::BLK / 2});
             }
             return;
         }
-
         if constexpr (SPREAD) {
-            // 紧凑矩阵一次搬入, 再用一条Gather展开成按DataBlock对齐的行布局。
-            const uint32_t packCount = cnt * N * N;
+            // 紧凑矩阵一次搬入, 收尾时再用一条Gather展开成按DataBlock对齐的行布局。
             AscendC::DataCopyExtParams packParams;
             packParams.blockCount = 1;
-            packParams.blockLen = packCount * sizeof(DT_LOGITS);
+            packParams.blockLen = cnt * N * N * sizeof(DT_LOGITS);
             packParams.srcStride = 0;
             packParams.dstStride = 0;
             packParams.rsv = 0;
@@ -277,21 +298,6 @@ private:
             } else {
                 AscendC::DataCopyPad(stage_, srcGm_[done * elems], packParams, packPad);
             }
-            // 地址表与紧凑搬入写的是互不相交的缓冲区, 放在搬运下发之后构造, 表算术
-            // 就在访存延迟的阴影里完成。
-            if (done == 0) {
-                BuildSpreadTables();
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            if constexpr (!IS_FP32) {
-                AscendC::SetMaskNorm();
-                AscendC::SetVectorMask<float>(0, MASK_FULL);
-                AscendC::Cast<float, DT_LOGITS, false>(
-                    t2_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
-                    Reps(packCount), {1, 1, mhcs::BLK, mhcs::BLK / 2});
-            }
-            AscendC::Gather(mat_, t2_, loff_, 0U, cnt * N * mhcs::BLK);
             return;
         }
 
@@ -305,18 +311,47 @@ private:
         padParams.isPad = true;
         padParams.leftPadding = 0;
         padParams.paddingValue = static_cast<DT_LOGITS>(0.0f);
-
         if constexpr (IS_FP32) {
             padParams.rightPadding = static_cast<uint8_t>(mhcs::BLK - n);
             AscendC::DataCopyPad(mat_, srcGm_[done * elems], copyParams, padParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         } else {
             padParams.rightPadding = static_cast<uint8_t>(2 * mhcs::BLK - n);
             AscendC::DataCopyPad(stage_, srcGm_[done * elems], copyParams, padParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            uint32_t rows = cnt * n;
+        }
+    }
+
+    __aicore__ inline void FinishLoad(uint32_t done, uint32_t cnt)
+    {
+        (void)done;
+        (void)cnt;
+        // 地址表与紧凑搬入写的是互不相交的缓冲区, 表算术就在访存延迟的阴影里完成。
+        if constexpr (SPREAD) {
+            if (done == 0) {
+                BuildSpreadTables();
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        if constexpr (IS_FP32) {
+            if constexpr (SPREAD) {
+                AscendC::Gather(mat_, t2_, loff_, 0U, cnt * N * mhcs::BLK);
+            }
+            return;
+        }
+        AscendC::SetMaskNorm();
+        AscendC::SetVectorMask<float>(0, MASK_FULL);
+        if constexpr (PACKED) {
+            // 一个迭代处理64个元素: 目的按8个DataBlock前进, 源为半精度按4个。
+            AscendC::Cast<float, DT_LOGITS, false>(
+                mat_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
+                static_cast<uint8_t>(cnt), {1, 1, mhcs::BLK, mhcs::BLK / 2});
+        } else if constexpr (SPREAD) {
+            AscendC::Cast<float, DT_LOGITS, false>(
+                t2_, stage_, AscendC::RoundMode::CAST_NONE, mhcs::MASK_PH,
+                Reps(cnt * N * N), {1, 1, mhcs::BLK, mhcs::BLK / 2});
+            AscendC::Gather(mat_, t2_, loff_, 0U, cnt * N * mhcs::BLK);
+        } else {
+            const uint32_t rows = cnt * order_;
             for (uint32_t base = 0; base < rows; base += mhcs::MAX_REPEAT) {
                 uint32_t step = rows - base;
                 if (step > mhcs::MAX_REPEAT) {
@@ -611,14 +646,20 @@ private:
     float eps_ = 0.0f;
 };
 
-template <typename DT_LOGITS, uint32_t ORDER_SEL>
+template <typename DT_LOGITS, uint32_t ORDER_SEL, uint32_t SPEC_SEL>
 __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR weights,
                                         GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
     AscendC::InitSocState();   // 不再经由TPipe, 这里显式复位与矢量相关的状态寄存器
-    GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
-    KernelMhcSinkhorn<DT_LOGITS, ORDER_SEL> op;
-    op.Init(logits, weights, tiling_data);
-    op.Process();
+    KernelMhcSinkhorn<DT_LOGITS, ORDER_SEL, SPEC_SEL> op;
+    if constexpr ((SPEC_SEL != 0) && (ORDER_SEL != 0)) {
+        op.SpecIssue(logits, weights);
+        GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
+        op.SpecRun(tiling_data);
+    } else {
+        GET_TILING_DATA_WITH_STRUCT(MhcSinkhornTilingData, tiling_data, tiling);
+        op.Init(logits, weights, tiling_data);
+        op.Process();
+    }
 }

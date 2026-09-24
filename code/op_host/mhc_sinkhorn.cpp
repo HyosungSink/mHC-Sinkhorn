@@ -15,6 +15,8 @@ constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元�
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
 constexpr uint64_t MIN_BLOCKS = 16;
+// 方阵数达到该值后不再补齐Block数, 让Block与方阵一一对应。
+constexpr uint64_t SPEC_MIN = 8;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -101,9 +103,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     uint64_t blocks = (total + perCore - 1) / perCore;
     // 实测单次Kernel的固定开销在逻辑Block数约16时最低(2/4个Block明显更慢, 全核启动
-    // 又会显著变慢), 因此对小规模输入把Block数补齐到
-    // MIN_BLOCKS个Block, 多余Block在Kernel内直接退出。
-    if (blocks < MIN_BLOCKS && coreNum >= MIN_BLOCKS) {
+    // 又会显著变慢), 因此对小规模输入把Block数补齐到MIN_BLOCKS个Block, 多余Block
+    // 在Kernel内直接退出。补齐到SPEC_MIN及以上时, 每个Block仍恰好一个方阵, 保持
+    // Block数与方阵数相等可以让Kernel省掉一次tiling等待。
+    if (blocks < MIN_BLOCKS && coreNum >= MIN_BLOCKS && blocks < SPEC_MIN) {
         blocks = MIN_BLOCKS;
     }
 
@@ -124,8 +127,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     if (order == 4 || order == 6 || order == 8) {
         ORDER_SEL = static_cast<uint32_t>(order);
     }
+    // 每个逻辑Block恰好负责一个方阵时, Kernel无需读tiling即可算出源地址, 搬入
+    // 就能排在tiling读取之前; 其余切分走一般路径。
+    uint32_t SPEC_SEL = (ORDER_SEL != 0 && perCore == 1 && blocks == total) ? 1u : 0u;
     uint32_t DT_LOGITS = static_cast<uint32_t>(dtype);
-    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, ORDER_SEL);
+    ASCENDC_TPL_SEL_PARAM(context, DT_LOGITS, ORDER_SEL, SPEC_SEL);
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     if (currentWorkspace == nullptr) {
