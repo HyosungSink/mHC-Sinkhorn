@@ -152,7 +152,7 @@ public:
         const int32_t spreadCount = static_cast<int32_t>(mats * N * mhcs::BLK);
         const int32_t packCount = static_cast<int32_t>(mats * N * N);
         AscendC::LocalTensor<int32_t> idx = t1_.template ReinterpretCast<int32_t>();
-        AscendC::LocalTensor<int32_t> aux = t2_.template ReinterpretCast<int32_t>();
+        AscendC::LocalTensor<int32_t> aux = bct_.template ReinterpretCast<int32_t>();
         AscendC::LocalTensor<int32_t> lo = loff_.template ReinterpretCast<int32_t>();
         AscendC::LocalTensor<int32_t> so = soff_.template ReinterpretCast<int32_t>();
 
@@ -181,6 +181,9 @@ public:
         AscendC::Muls(aux, aux, static_cast<int32_t>(mhcs::BLK), packCount);
         AscendC::Add(so, so, aux, packCount);
         AscendC::Muls(so, so, static_cast<int32_t>(mhcs::FSZ), packCount);
+        // 地址表由矢量流水写出, 而紧凑搬入由MTE2写同一片UB区域, 需显式定序。
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     }
 
     __aicore__ inline void Process()
