@@ -99,17 +99,18 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     // Block数按每个Block至多 MAX_PER_BLOCK 个方阵定出, 再夹在 TARGET_BLOCKS 与
     // 核数之间。实测空Kernel在16个Block上约1.15微秒, 在8个上反而约1.26, 在24与
     // 40个上升到1.71与2.08, 整算子上的差别同向且更大, 因此取16。
-    uint64_t blocks = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
-    if (blocks < TARGET_BLOCKS) {
-        blocks = TARGET_BLOCKS;
-    }
+    // 有活干的Block数由每个Block至多 MAX_PER_BLOCK 个方阵定出; 逻辑Block数再补齐
+    // 到 TARGET_BLOCKS。补齐只影响启动, 不能把每个Block的方阵数重新摊薄, 否则
+    // MAX_PER_BLOCK 就失效了。
+    const uint64_t busy = (total + MAX_PER_BLOCK - 1) / MAX_PER_BLOCK;
+    uint64_t blocks = (busy < TARGET_BLOCKS) ? TARGET_BLOCKS : busy;
     if (blocks > coreNum) {
         blocks = coreNum;
     }
     if (blocks == 0) {
         blocks = 1;
     }
-    uint64_t perCore = (total + blocks - 1) / blocks;
+    uint64_t perCore = (busy <= blocks) ? MAX_PER_BLOCK : ((total + blocks - 1) / blocks);
     if (perCore == 0) {
         perCore = 1;
     }
