@@ -14,9 +14,10 @@ constexpr uint32_t SLACK = 2 * MAX_ORDER;  // 折叠指令跨迭代预读的富�
 constexpr int32_t MASK_PH = 0;         // isSetMask=false 时的掩码占位值
 
 // 收敛判据: 当所有归一化因子与1的偏差小于该阈值时, 后续迭代对结果的改变
-// 已远小于数值容差, 迭代提前结束。判据每 CHECK_STRIDE 次迭代评估一次。
-constexpr float CONVERGE_TOL = 1.0e-6f;
-constexpr uint32_t CHECK_STRIDE = 4;
+// 已远小于数值容差, 迭代随即结束。判据在每次迭代中评估。
+// 判据阈值取 1e-4: 归一化因子落在 1±1e-4 后, 剩余迭代对输出的累计改变约为同量级,
+// 相对数值比对容差(1e-3)仍有十倍余量。
+constexpr float CONVERGE_TOL = 1.0e-4f;
 
 // 缓冲区容量, 单位: float元素。
 constexpr uint32_t BLOCKS = CHUNK * MAX_ORDER + SLACK;
@@ -303,7 +304,7 @@ private:
             AscendC::SetVectorMask<float>(0, MASK_ALL);
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
-            if (canCheck && (i % mhcs::CHECK_STRIDE) == 0 && Settled<SINGLE>(rep, devRep)) {
+            if (canCheck && Settled<SINGLE>(rep, devRep)) {
                 break;
             }
             AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
@@ -320,16 +321,20 @@ private:
         AscendC::Adds<float, false>(dev_, bct_, -1.0f, mhcs::MASK_PH, rep,
                                     {1, 1, NB, mhcs::BLK});
         AscendC::Abs<float, false>(dev_, dev_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
-        AscendC::SetVectorMask<float>(0, ~0ULL);
-        AscendC::BlockReduceMax<float, false>(mx_, dev_, devRep, mhcs::MASK_PH, 1, 1, mhcs::BLK);
-        AscendC::SetVectorMask<float>(0, SINGLE ? mhcs::FullMask(
-            ((N + mhcs::BLK - 1) / mhcs::BLK) * mhcs::BLK) : mhcs::FullMask(devRep * mhcs::BLK));
-        AscendC::WholeReduceMax<float, false>(res_, mx_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
+        if constexpr (SINGLE) {
+            // 单方阵时偏差恰好占满一个迭代(n*8 <= 64 lane), 一条归约指令即可取到最大值。
+            AscendC::WholeReduceMax<float, false>(res_, dev_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
+        } else {
+            AscendC::SetVectorMask<float>(0, ~0ULL);
+            AscendC::BlockReduceMax<float, false>(mx_, dev_, devRep, mhcs::MASK_PH, 1, 1,
+                                                  mhcs::BLK);
+            AscendC::SetVectorMask<float>(0, mhcs::FullMask(devRep * mhcs::BLK));
+            AscendC::WholeReduceMax<float, false>(res_, mx_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
+            AscendC::SetVectorMask<float>(0, MASK_ALL);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        const float worst = res_.GetValue(0);
-        AscendC::SetVectorMask<float>(0, MASK_ALL);
-        return worst < mhcs::CONVERGE_TOL;
+        return res_.GetValue(0) < mhcs::CONVERGE_TOL;
     }
 
     template <bool SINGLE>
