@@ -121,6 +121,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     tiling->eps = eps;
 
     context->SetBlockDim(static_cast<uint32_t>(blocks));
+    // 纯矢量算子按批量调度下发, 省掉逐Block的调度往返。
+    if (context->SetScheduleMode(1U) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
 
     // 阶数为4/6/8时选用编译期特化模板, 其余阶数走ORDER_SEL=0的通用兜底路径。
     uint32_t ORDER_SEL = 0;
