@@ -468,7 +468,8 @@ private:
             }
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
-            if (canCheck && Settled<SINGLE>(rep, devRep)) {
+            // 第一趟的因子必然还远离1(softmax后只做过一次列归一), 该趟不做判定。
+            if (i > 1 && canCheck && Settled<SINGLE>(rep, devRep)) {
                 break;
             }
             AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
