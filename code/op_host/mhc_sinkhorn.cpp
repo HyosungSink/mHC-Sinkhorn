@@ -14,7 +14,10 @@ constexpr int64_t MAX_ORDER = 8;
 constexpr int64_t MAX_MATRICES = 1073741823;  // 方阵总数上限, 避免元素数溢出uint32
 constexpr uint32_t DEFAULT_ITERS = 20;
 constexpr float DEFAULT_EPS = 1e-6f;
-constexpr uint64_t MIN_BLOCKS = 16;
+constexpr uint64_t MIN_BLOCKS = 8;
+// 交给同一个Block的方阵数: 阶数为4时一组2个, 其余一组4个。
+constexpr uint64_t GROUP_SMALL = 2;
+constexpr uint64_t GROUP_LARGE = 4;
 
 // 方阵阶数约束: 题面定义为偶数阶且不超过一个DataBlock可容纳的float数。
 // 采用区间与整除性判定而非逐值枚举, 隐藏用例只要落在该区间即可走通用路径。
@@ -95,17 +98,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         coreNum = 1;
     }
     const uint64_t total = static_cast<uint64_t>(matrices);
-    // 每个逻辑Block负责一个方阵: 多方阵合并到同一条指令只会提高单条指令的迭代数,
-    // 依赖链并不变短, 而合并后走的多方阵分支每轮要多下发几次掩码, 实测更慢。
-    uint64_t perCore = (total + coreNum - 1) / coreNum;
+    // 依赖链的长度与单条指令的迭代数无关, 但每个Block都要自己下发一次搬入和一次
+    // 搬出, 而这些小段搬运共用同一条访存通道。把若干个方阵交给同一个Block, 搬运
+    // 次数按组数下降, 指令条数不变。n=4的一行只占半个DataBlock, 一组取2个。
+    const uint64_t group = (order == 4) ? GROUP_SMALL : GROUP_LARGE;
+    const uint64_t tasks = (total + group - 1) / group;
+    uint64_t blocks = (tasks < MIN_BLOCKS) ? MIN_BLOCKS : tasks;
+    if (blocks > coreNum) {
+        blocks = coreNum;
+    }
+    if (blocks == 0) {
+        blocks = 1;
+    }
+    uint64_t perCore = (tasks <= coreNum) ? group : ((total + blocks - 1) / blocks);
     if (perCore == 0) {
         perCore = 1;
-    }
-    uint64_t blocks = (total + perCore - 1) / perCore;
-    // 固定开销随逻辑Block数增长, 但Block数过小时单次启动反而明显更慢; 实测在
-    // MIN_BLOCKS个Block附近最低, 因此对小规模输入补齐到该数, 多余Block直接退出。
-    if (blocks < MIN_BLOCKS && coreNum >= MIN_BLOCKS) {
-        blocks = MIN_BLOCKS;
     }
 
     MhcSinkhornTilingData *tiling = context->GetTilingData<MhcSinkhornTilingData>();

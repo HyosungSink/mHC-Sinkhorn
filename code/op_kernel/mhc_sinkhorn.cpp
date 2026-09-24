@@ -436,11 +436,18 @@ private:
         const uint8_t rep = SINGLE ? uint8_t{1} : static_cast<uint8_t>(cnt);
         const uint8_t repVec = SINGLE ? uint8_t{1} : mhcs::CeilDiv(cnt, N);
         const uint32_t devBlocks = SINGLE ? N : cnt * N;
-        const bool canCheck = SINGLE ? true : (devBlocks <= 64);
+        // 行和向量每个方阵占一个DataBlock, 常驻掩码覆盖 N 个DataBlock, 因此方阵数
+        // 不超过 N 时一条归约就能读全; 超出时回到分级归约的通道。
+        const bool cheapCheck = SINGLE || (cnt <= N);
+        const bool canCheck = cheapCheck || (devBlocks <= 64);
         const uint8_t devRep = SINGLE ? uint8_t{(N + mhcs::BLK - 1) / mhcs::BLK}
                                       : mhcs::CeilDiv(devBlocks, mhcs::BLK);
 
         AscendC::SetMaskNorm();
+        AscendC::SetVectorMask<float>(0, MASK_FULL);
+        // 掩码覆盖的DataBlock比本轮的方阵数多时, 多出来的那些必须落在判据区间的
+        // 正中, 否则判据永远不成立。加上eps之后它们恰好等于1。
+        AscendC::Duplicate<float, false>(rs_, 1.0f - eps_, mhcs::MASK_PH, 1, 1, mhcs::BLK);
         AscendC::SetVectorMask<float>(0, MASK_COL);
         AscendC::BlockReduceMax<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
@@ -471,7 +478,7 @@ private:
             AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         if constexpr (!SINGLE) {
-            if (canCheck) {
+            if (canCheck && !cheapCheck) {
                 AscendC::SetVectorMask<float>(0, MASK_FULL);
                 AscendC::Duplicate<float, false>(dev_, 0.0f, mhcs::MASK_PH, devRep, 1,
                                                  mhcs::BLK);
@@ -481,15 +488,33 @@ private:
         ColumnStep<SINGLE>(cnt, rep, repVec);
         for (uint32_t i = 1; i < iters_; ++i) {
             AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
+            // 判据直接读行和, 与后面的广播和加eps互不依赖, 两条归约因此排在它们
+            // 旁边而不是串在后面。第一趟的因子必然还远离1, 该趟不做判定。
+            const bool probe = (i > 1) && canCheck;
+            if (probe && cheapCheck) {
+                AscendC::WholeReduceMax<float, false>(res_, rs_, mhcs::MASK_PH, 1, 1, 1,
+                                                      mhcs::BLK);
+                AscendC::WholeReduceMin<float, false>(mx_, rs_, mhcs::MASK_PH, 1, 1, 1,
+                                                      mhcs::BLK);
+            }
             AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
             if constexpr (NEEDS_MASK) {
                 AscendC::SetVectorMask<float>(0, MASK_COL);
             }
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
-            // 第一趟的因子必然还远离1(softmax后只做过一次列归一), 该趟不做判定。
-            if (i > 1 && canCheck && Settled<SINGLE>(rep, devRep)) {
-                break;
+            if (probe) {
+                if (cheapCheck) {
+                    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+                    const float high = res_.GetValue(0) + eps_;
+                    const float low = mx_.GetValue(0) + eps_;
+                    if (high < 1.0f + mhcs::CONVERGE_TOL && low > 1.0f - mhcs::CONVERGE_TOL) {
+                        break;
+                    }
+                } else if (Settled<SINGLE>(rep, devRep)) {
+                    break;
+                }
             }
             AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                        {1, 1, 1, NB, NB, mhcs::BLK});
