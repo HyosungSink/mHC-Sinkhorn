@@ -108,7 +108,6 @@ private:
         const uint64_t elems = static_cast<uint64_t>(n) * n;
         // 先清零整块工作区，避免残留lane影响归约结果与确定性。
         AscendC::Duplicate(mat_, 0.0f, static_cast<int32_t>(cnt * n * mhcs::BLK));
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::DataCopyExtParams copyParams;
         copyParams.blockCount = static_cast<uint16_t>(cnt * n);
@@ -142,7 +141,6 @@ private:
                               AscendC::RoundMode::CAST_NONE, mhcs::BLK,
                               static_cast<uint8_t>(step), {1, 1, 1, 1});
             }
-            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
@@ -191,22 +189,15 @@ private:
 
         // --- 初始化: 行方向softmax + eps ---
         AscendC::BlockReduceMax<float>(rs_, mat_, rep, colMask, 1, 1, static_cast<int32_t>(n));
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sub(mat_, mat_, bct_, colMask, rep,
                      {1, 1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n), mhcs::BLK});
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Exp(mat_, mat_, colMask, rep,
                      {1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n)});
-        AscendC::PipeBarrier<PIPE_V>();
         RowSum(cnt, rep, fullMask, n);
-        AscendC::PipeBarrier<PIPE_V>();
         RowDivide(rep, fullMask, n);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(mat_, mat_, eps_, colMask, rep,
                       {1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n)});
-        AscendC::PipeBarrier<PIPE_V>();
 
         ColumnStep(cnt, rep, fullMask, n);
         for (uint32_t i = 1; i < iters_; ++i) {
@@ -223,7 +214,6 @@ private:
     __aicore__ inline void RowDivide(uint8_t rep, int32_t fullMask, uint32_t n)
     {
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Div(mat_, mat_, bct_, fullMask, rep,
                      {1, 1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n), mhcs::BLK});
     }
@@ -231,22 +221,16 @@ private:
     __aicore__ inline void RowStep(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
     {
         RowSum(cnt, rep, fullMask, n);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(rs_, rs_, eps_, static_cast<int32_t>(cnt * mhcs::BLK));
-        AscendC::PipeBarrier<PIPE_V>();
         RowDivide(rep, fullMask, n);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void ColumnStep(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
     {
         ColumnSum(rep, n);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(cs_, cs_, eps_, static_cast<int32_t>(cnt * mhcs::BLK));
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Div(mat_, mat_, cs_, fullMask, rep,
                      {1, 1, 0, static_cast<uint8_t>(n), static_cast<uint8_t>(n), 1});
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     // 列方向求和: 折叠 n 个DataBlock。
@@ -254,25 +238,19 @@ private:
     {
         if constexpr (ORDER_SEL == 8) {
             AscendC::Add(t1_, mat_, mat_[4 * mhcs::BLK], 32, rep, {1, 1, 1, 4, 8, 8});
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(t2_, t1_, t1_[2 * mhcs::BLK], 16, rep, {1, 1, 1, 2, 4, 4});
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(cs_, t2_, t2_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 2, 2});
         } else if constexpr (ORDER_SEL == 6) {
             AscendC::Add(t1_, mat_, mat_[3 * mhcs::BLK], 24, rep, {1, 1, 1, 3, 6, 6});
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(t2_, t1_, t1_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 3, 3});
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(cs_, t2_, t1_[2 * mhcs::BLK], 8, rep, {1, 1, 1, 1, 1, 3});
         } else if constexpr (ORDER_SEL == 4) {
             AscendC::Add(t1_, mat_, mat_[2 * mhcs::BLK], 16, rep, {1, 1, 1, 2, 4, 4});
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(cs_, t1_, t1_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 2, 2});
         } else {
             const uint8_t stride = static_cast<uint8_t>(n);
             AscendC::Add(cs_, mat_, mat_[mhcs::BLK], 8, rep, {1, 1, 1, 1, stride, stride});
             for (uint32_t r = 2; r < n; ++r) {
-                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Add(cs_, cs_, mat_[r * mhcs::BLK], 8, rep, {1, 1, 1, 1, 1, stride});
             }
         }
