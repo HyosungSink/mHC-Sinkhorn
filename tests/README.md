@@ -141,9 +141,9 @@ python3 -m tests.st.scripts.profile_mock_workloads
 构建默认 16 路并发，使用 `--jobs` 调整；设备测试产物放在 `/tmp/cannjudge/mhcsinkhorn/local-tests`。
 缓存条目的文件清单与校验信息保存在 `.artifact-cache.json`。
 `--build-dir` 指定工作区源码的构建缓存根，`--report` 指定报告路径；运行不同集合时可分别指定报告。
-正确性用例预热 1 次、执行 3 次比较。Mock 在三个独立进程中分别采样：Case 1、2、5 每个进程三次，Case 3、4 每个进程一次。
-取三个进程均值的中位数。每个进程先至少预热五次，同时从首次同步完成开始计时，继续预热
-直到经过配置时长：Case 1 为 400 μs，其余为 260 μs。报告保存实际预热次数与准备阶段用时。使用 MSPTI Kernel 时间戳，
+正确性用例预热 1 次、执行 3 次比较。全部五个 Mock 采用同一计时协议：
+三个独立进程，每进程预热 4 次、测量 12 次，取三个进程均值的中位数。
+报告保存实际预热次数与准备阶段用时。使用 MSPTI Kernel 时间戳，
 预热阶段用时不计入被测 Kernel 耗时。每次测量前先在独立进程中执行相同的设备状态准备：
 对 40 个 AIV block 的前 128 KiB UB 写入 float32 1.0，并核验各 block 的完成回执；
 该进程退出后，再启动只执行被测算子的测量进程。准备 Kernel 的时间不计入被测耗时。
@@ -153,9 +153,9 @@ JSON 报告记录计时参数、案例结果与构建身份。
 数值错误计数取首次预热输出与最终输出中最早发现的数值失败；最终输出仍会检查，
 首尾输出不一致仍报告 Wrong Answer。`*.output.tsv` 保存错误计数对应的输出，
 不一致时另保存 `*.first_output.tsv` 或 `*.last_output.tsv` 供定位；无预热时检查最终输出。
-可用 `--warmup` 调整最少预热次数，`--warmup-us` 调整准备阶段的最短时间，
-`--repeat` 统一覆盖所选 Case 的采样次数；未指定时采用用例配置中的 `repeat`，缺省为 1。
-`--warmup-us` 未指定时采用用例配置中的 `warmup_us`，缺省为 260。所有版本共用这些固定 Case 参数。
+可用 `--warmup` 统一覆盖所选 Case 的预热次数，`--warmup-us` 调整准备阶段的最短时间，
+`--repeat` 统一覆盖所选 Case 的采样次数；未指定时采用用例配置中的 `warmup` 和 `repeat`。
+`--warmup-us` 未指定时采用用例配置中的 `warmup_us`，Mock 缺省为 0。所有版本共用这些固定 Case 参数。
 `--warmup-us 0` 仅按次数预热。用 `--interval-us` 设置调用间隔（不计入 Kernel 耗时），
 或用 `--device-state unprepared` 关闭设备准备。比较不同版本时应保持这些参数一致。
 

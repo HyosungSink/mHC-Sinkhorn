@@ -73,7 +73,7 @@ def test_contract_dataset_recovers_from_invalid_cache(tmp_path):
     assert check(folder) == []
 
 
-@pytest.mark.parametrize('case,digest', [(1, 'f38666fbe647212cfd4908643c61c0111ab5ab4df218dd1c1a12b4cf3bac9d0c'), (2, '91d241bbda2ef84c03c83293c7045690650dcc8637db0179bacca481ec763a5c'), (3, '390c204a99cef6a6f8438e2537d2c831bfec451d0242a2cea45e611ea9356a18'), (4, 'cd32e9c0fb3c1c6d891d4b10f842931e5605d57fff399d3c46c297fb77b5742f'), (5, '3bda54ef2c52eadc0d9349154d66cb842ac1f1b08f45460e16a8ebd67c623942')])
+@pytest.mark.parametrize('case,digest', [(1, 'f38666fbe647212cfd4908643c61c0111ab5ab4df218dd1c1a12b4cf3bac9d0c'), (2, '91d241bbda2ef84c03c83293c7045690650dcc8637db0179bacca481ec763a5c'), (3, '390c204a99cef6a6f8438e2537d2c831bfec451d0242a2cea45e611ea9356a18'), (4, 'cd32e9c0fb3c1c6d891d4b10f842931e5605d57fff399d3c46c297fb77b5742f'), (5, 'd47eb544ba78155aca72f72113461379271ced2f99af3b2fbd6c13ca06425e58')])
 def test_mock_input_bytes(case, digest):
     import hashlib
     from tests.common.cases import load_cases
