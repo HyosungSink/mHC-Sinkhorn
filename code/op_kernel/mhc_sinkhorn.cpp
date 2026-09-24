@@ -288,12 +288,12 @@ private:
         AscendC::Exp<float, false>(mat_, mat_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
 
         if constexpr (NEEDS_MASK) {
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
         if constexpr (NEEDS_MASK) {
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
                                    {1, 1, 1, NB, NB, mhcs::BLK});
@@ -304,18 +304,18 @@ private:
         AscendC::Adds<float, false>(mat_, mat_, eps_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
 
         if constexpr (NEEDS_MASK) {
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         if (canCheck) {
             AscendC::Duplicate(dev_, 0.0f, static_cast<int32_t>(devRep * mhcs::BLK * mhcs::BLK));
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         ColumnStep<SINGLE>(cnt, rep, repVec);
         for (uint32_t i = 1; i < iters_; ++i) {
             AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
             AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
             if constexpr (NEEDS_MASK) {
-                AscendC::SetVectorMask<float>(0, MASK_ALL);
+                AscendC::SetVectorMask<float>(0, MASK_COL);
             }
             AscendC::Adds<float, false>(bct_, bct_, eps_, mhcs::MASK_PH, rep,
                                         {1, 1, mhcs::BLK, mhcs::BLK});
@@ -345,7 +345,7 @@ private:
                                                   mhcs::BLK);
             AscendC::SetVectorMask<float>(0, mhcs::FullMask(devRep * mhcs::BLK));
             AscendC::WholeReduceMax<float, false>(res_, mx_, mhcs::MASK_PH, 1, 1, 1, mhcs::BLK);
-            AscendC::SetVectorMask<float>(0, MASK_ALL);
+            AscendC::SetVectorMask<float>(0, MASK_COL);
         }
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
