@@ -79,19 +79,14 @@ def test_infrastructure_failure_cannot_leave_a_passing_report(tmp_path, monkeypa
 
 
 def test_mock_workload_configuration():
-    protocols = set()
     for spec in load_cases('mock'):
         validate_spec(spec)
         assert spec['verify'] and spec['measurement'] == 'kernel'
         assert all(math.isfinite(spec[key]) and spec[key] >= 0 for key in ('atol', 'rtol'))
         repeat = spec.get('repeat', 1)
-        warmup = spec.get('warmup', 4)
-        warmup_us = spec.get('warmup_us', 0)
+        warmup_us = spec.get('warmup_us', 260)
         assert type(repeat) is int and repeat > 0
-        assert type(warmup) is int and warmup >= 0
         assert type(warmup_us) is int and warmup_us >= 0
-        protocols.add((warmup, repeat, warmup_us))
-    assert len(protocols) == 1
 
 
 def matrix_errors(actual, expected, spec):

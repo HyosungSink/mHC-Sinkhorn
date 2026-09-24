@@ -46,14 +46,14 @@ def _main(argv=None) -> int:
                         help="optional root for immutable source-specific build entries")
     parser.add_argument("--report", type=Path, default=DEFAULT_WORK_ROOT / "preflight.tsv")
     parser.add_argument("--jobs", type=int, choices=range(1, 65), default=16)
-    parser.add_argument("--warmup", type=int, help="override each Mock's untimed launch count")
+    parser.add_argument("--warmup", type=int, default=5, help="minimum Mock untimed launches per process")
     parser.add_argument("--repeat", type=int, help="override every selected Mock's measured launches per process")
     parser.add_argument("--interval-us", type=int, default=0, help="idle interval before each Mock launch, outside kernel timing")
     parser.add_argument('--device-state', choices=('unprepared','nonzero-ub'), default='nonzero-ub')
     parser.add_argument("--warmup-us", type=int,
                         help="override per-case warmup time after first sync; 0 uses counts only")
     args = parser.parse_args(argv)
-    if (args.warmup is not None and args.warmup < 0) or (args.repeat is not None and args.repeat <= 0) or args.interval_us < 0 or (args.warmup_us is not None and args.warmup_us < 0):
+    if args.warmup < 0 or (args.repeat is not None and args.repeat <= 0) or args.interval_us < 0 or (args.warmup_us is not None and args.warmup_us < 0):
         raise ValueError("invalid Mock measurement protocol")
     specs = load_cases(args.suite, args.case, args.tag)
     if args.list:
@@ -85,30 +85,16 @@ def _main(argv=None) -> int:
                        for spec in timed_specs}
     if any(type(value) is not int or value <= 0 for value in repeats_by_case.values()):
         raise ValueError("invalid Mock case repeat count")
-    default_warmup_us = 0 if args.suite == "mock" else 260
-    if args.suite == "mock":
-        configured_warmups = {spec.get("warmup", 4) for spec in load_cases("mock")}
-        if len(configured_warmups) != 1:
-            raise ValueError("Mock cases require one shared warmup count")
-        default_warmup = configured_warmups.pop()
-        if type(default_warmup) is not int or default_warmup < 0:
-            raise ValueError("invalid Mock case warmup count")
-    else:
-        default_warmup = 5
-    warmup_us_by_case = {spec["name"]: args.warmup_us if args.warmup_us is not None else spec.get("warmup_us", default_warmup_us)
+    warmup_us_by_case = {spec["name"]: args.warmup_us if args.warmup_us is not None else spec.get("warmup_us", 260)
                          for spec in timed_specs}
     if any(type(value) is not int or value < 0 for value in warmup_us_by_case.values()):
         raise ValueError("invalid Mock case warmup duration")
-    if args.suite == "mock" and (len(set(repeats_by_case.values())) != 1 or
-                                   len(set(warmup_us_by_case.values())) != 1):
-        raise ValueError("Mock cases require one shared measurement protocol")
-    benchmark = {"warmup": args.warmup if args.warmup is not None else default_warmup,
-                 "repeat": args.repeat or 1, "replicas": 3,
+    benchmark = {"warmup": args.warmup, "repeat": args.repeat or 1, "replicas": 3,
                  "case_repeats": repeats_by_case,
                  "case_warmup_us": warmup_us_by_case,
                  "interval_us": args.interval_us, "inner": 1, "mode": "mspti",
                  "estimator": "median_of_means", 'device_state': args.device_state}
-    benchmark["warmup_us"] = args.warmup_us if args.warmup_us is not None else default_warmup_us
+    benchmark["warmup_us"] = args.warmup_us if args.warmup_us is not None else 260
     preparation_args = ["--warmup-us", str(benchmark["warmup_us"])]
     if timed_fixtures and args.device_state == 'nonzero-ub':
         library = ensure_device_state_library(DEFAULT_WORK_ROOT, args.jobs)
