@@ -10,26 +10,27 @@ constexpr uint32_t BLK = 8;            // 一个32B DataBlock容纳的float个�
 constexpr uint32_t MAX_ORDER = 8;      // 支持的最大方阵阶数
 constexpr uint32_t CHUNK = 64;         // 单轮驻留UB的方阵数上限
 constexpr uint32_t MAX_REPEAT = 255;   // 单条矢量指令的最大迭代数
+constexpr uint32_t SLACK = 2 * MAX_ORDER;
+constexpr int32_t MASK_PH = 0;         // isSetMask=false 时的掩码占位值  // 折叠指令跨迭代预读的富余DataBlock数
 
-// UB分区（单位: float元素），按CHUNK个方阵的最坏情况预留。
-constexpr uint32_t MAT_CAP = CHUNK * MAX_ORDER * BLK;   // 主矩阵缓冲
-constexpr uint32_t BCT_CAP = CHUNK * MAX_ORDER * BLK;   // Brcb展开缓冲
-constexpr uint32_t VEC_CAP = CHUNK * BLK;               // 行/列和缓冲
-constexpr uint32_t T1_CAP = CHUNK * 4 * BLK;
-constexpr uint32_t T2_CAP = CHUNK * 2 * BLK;
+// 缓冲区容量, 单位: float元素。
+constexpr uint32_t BLOCKS = CHUNK * MAX_ORDER + SLACK;
+constexpr uint32_t MAT_CAP = BLOCKS * BLK;
+constexpr uint32_t BCT_CAP = (CHUNK + 1) * MAX_ORDER * BLK;
+constexpr uint32_t VEC_CAP = (CHUNK + SLACK) * BLK;
 
 constexpr uint32_t OFF_MAT = 0;
 constexpr uint32_t OFF_BCT = OFF_MAT + MAT_CAP;
-constexpr uint32_t OFF_RS = OFF_BCT + BCT_CAP;
+constexpr uint32_t OFF_T1 = OFF_BCT + BCT_CAP;
+constexpr uint32_t OFF_T2 = OFF_T1 + MAT_CAP;
+constexpr uint32_t OFF_RS = OFF_T2 + MAT_CAP;
 constexpr uint32_t OFF_CS = OFF_RS + VEC_CAP;
-constexpr uint32_t OFF_T1 = OFF_CS + VEC_CAP;
-constexpr uint32_t OFF_T2 = OFF_T1 + T1_CAP;
-constexpr uint32_t OFF_STG = OFF_T2 + T2_CAP;           // 半精度落地区(以float计)
-constexpr uint32_t STG_CAP = CHUNK * MAX_ORDER * BLK;
+constexpr uint32_t OFF_STG = OFF_CS + VEC_CAP;
+constexpr uint32_t STG_CAP = CHUNK * MAX_ORDER * 2 * BLK;   // 半精度落地区(以float计)
 constexpr uint32_t UB_FLOATS = OFF_STG + STG_CAP;
 
-// 每个DataBlock内前 n 个lane置位的逐bit掩码。
-__aicore__ inline uint64_t LaneMask(uint32_t n, uint32_t blocks)
+// 每个DataBlock内前 n 个lane置位、共 blocks 个DataBlock的逐bit掩码。
+constexpr uint64_t LaneMask(uint32_t n, uint32_t blocks)
 {
     uint64_t lane = (n >= BLK) ? 0xFFULL : ((1ULL << n) - 1ULL);
     uint64_t value = 0;
@@ -39,17 +40,36 @@ __aicore__ inline uint64_t LaneMask(uint32_t n, uint32_t blocks)
     return value;
 }
 
+// 前 lanes 个lane全部置位的连续掩码。
+constexpr uint64_t FullMask(uint32_t lanes)
+{
+    return (lanes >= 64) ? ~0ULL : ((1ULL << lanes) - 1ULL);
+}
+
+__aicore__ inline uint8_t CeilDiv(uint32_t value, uint32_t divisor)
+{
+    return static_cast<uint8_t>((value + divisor - 1) / divisor);
+}
+
 }  // namespace mhcs
 
 template <typename DT_LOGITS, uint32_t ORDER_SEL>
 class KernelMhcSinkhorn {
+    static constexpr bool FAST = (ORDER_SEL != 0);
+    static constexpr uint32_t N = FAST ? ORDER_SEL : mhcs::MAX_ORDER;
+    static constexpr int32_t SPAN = static_cast<int32_t>(N * mhcs::BLK);
+    static constexpr uint64_t MASK_ALL = mhcs::FullMask(N * mhcs::BLK);
+    static constexpr uint64_t MASK_COL = mhcs::LaneMask(N, N);
+    static constexpr uint8_t NB = static_cast<uint8_t>(N);
+    static constexpr uint8_t NB2 = static_cast<uint8_t>(2 * N);
+
 public:
     __aicore__ inline KernelMhcSinkhorn() {}
 
     __aicore__ inline void Init(GM_ADDR logits, GM_ADDR weights,
                                 const MhcSinkhornTilingData &tiling)
     {
-        order_ = (ORDER_SEL != 0) ? ORDER_SEL : tiling.order;
+        order_ = FAST ? ORDER_SEL : tiling.order;
         iters_ = tiling.iters;
         eps_ = tiling.eps;
 
@@ -72,10 +92,10 @@ public:
         AscendC::LocalTensor<float> base = buf_.Get<float>();
         mat_ = base[mhcs::OFF_MAT];
         bct_ = base[mhcs::OFF_BCT];
-        rs_ = base[mhcs::OFF_RS];
-        cs_ = base[mhcs::OFF_CS];
         t1_ = base[mhcs::OFF_T1];
         t2_ = base[mhcs::OFF_T2];
+        rs_ = base[mhcs::OFF_RS];
+        cs_ = base[mhcs::OFF_CS];
         stage_ = base[mhcs::OFF_STG].template ReinterpretCast<DT_LOGITS>();
     }
 
@@ -84,18 +104,17 @@ public:
         if (count_ == 0) {
             return;
         }
-        const uint32_t rowBlocks = order_;              // 每个方阵占用的DataBlock数
-        const uint32_t matStride = rowBlocks * mhcs::BLK;
-        const uint32_t laneMaskLow = 0;                 // 占位, 实际掩码在下方构造
-        (void)laneMaskLow;
-
         for (uint32_t done = 0; done < count_; done += mhcs::CHUNK) {
             uint32_t cnt = count_ - done;
             if (cnt > mhcs::CHUNK) {
                 cnt = mhcs::CHUNK;
             }
             LoadChunk(done, cnt);
-            Compute(cnt, matStride);
+            if constexpr (FAST) {
+                ComputeFast(cnt);
+            } else {
+                ComputeGeneric(cnt);
+            }
             StoreChunk(done, cnt);
         }
     }
@@ -106,8 +125,8 @@ private:
     {
         const uint32_t n = order_;
         const uint64_t elems = static_cast<uint64_t>(n) * n;
-        // 先清零整块工作区，避免残留lane影响归约结果与确定性。
-        AscendC::Duplicate(mat_, 0.0f, static_cast<int32_t>(cnt * n * mhcs::BLK));
+        // 清零工作区与折叠指令的预读富余区, 保证结果与残留lane无关。
+        AscendC::Duplicate(mat_, 0.0f, static_cast<int32_t>((cnt * n + mhcs::SLACK) * mhcs::BLK));
 
         AscendC::DataCopyExtParams copyParams;
         copyParams.blockCount = static_cast<uint16_t>(cnt * n);
@@ -118,15 +137,14 @@ private:
         AscendC::DataCopyPadExtParams<DT_LOGITS> padParams;
         padParams.isPad = true;
         padParams.leftPadding = 0;
-        padParams.rightPadding = static_cast<uint8_t>(mhcs::BLK - n);
         padParams.paddingValue = static_cast<DT_LOGITS>(0.0f);
 
         if constexpr (AscendC::IsSameType<DT_LOGITS, float>::value) {
+            padParams.rightPadding = static_cast<uint8_t>(mhcs::BLK - n);
             AscendC::DataCopyPad(mat_, srcGm_[done * elems], copyParams, padParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         } else {
-            // 半精度: 每行落到32B对齐位置，再按行升精度到float布局。
             padParams.rightPadding = static_cast<uint8_t>(2 * mhcs::BLK - n);
             AscendC::DataCopyPad(stage_, srcGm_[done * elems], copyParams, padParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -179,81 +197,110 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
     }
 
-    // ---------------------------------------------------------------- 主计算
-    __aicore__ inline void Compute(uint32_t cnt, uint32_t matStride)
+    // ------------------------------------------------ 特化路径: 掩码常驻矢量寄存器
+    //
+    // 主循环中每条矢量指令都使用同一个 N*8 lane 掩码, 因此掩码寄存器只在进入循环
+    // 前设置一次; 列方向折叠改用DataBlock步长成对相加, 从而与行方向共享掩码。
+    __aicore__ inline void ComputeFast(uint32_t cnt)
+    {
+        const uint8_t rep = static_cast<uint8_t>(cnt);
+        const uint8_t repVec = mhcs::CeilDiv(cnt, N);
+
+        AscendC::SetVectorMask<float>(0, MASK_COL);
+        AscendC::BlockReduceMax<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
+        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+        AscendC::Sub<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
+                                   {1, 1, 1, NB, NB, mhcs::BLK});
+        AscendC::Exp<float, false>(mat_, mat_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
+
+        AscendC::SetVectorMask<float>(0, MASK_ALL);
+        AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
+        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+        AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
+                                   {1, 1, 1, NB, NB, mhcs::BLK});
+
+        AscendC::SetVectorMask<float>(0, MASK_COL);
+        AscendC::Adds<float, false>(mat_, mat_, eps_, mhcs::MASK_PH, rep, {1, 1, NB, NB});
+
+        AscendC::SetVectorMask<float>(0, MASK_ALL);
+        ColumnStep(cnt, rep, repVec);
+        for (uint32_t i = 1; i < iters_; ++i) {
+            AscendC::BlockReduceSum<float, false>(rs_, mat_, rep, mhcs::MASK_PH, 1, 1, NB);
+            AscendC::Adds<float, false>(rs_, rs_, eps_, mhcs::MASK_PH, repVec, {1, 1, NB, NB});
+            AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+            AscendC::Div<float, false>(mat_, mat_, bct_, mhcs::MASK_PH, rep,
+                                       {1, 1, 1, NB, NB, mhcs::BLK});
+            ColumnStep(cnt, rep, repVec);
+        }
+        AscendC::ResetMask();
+    }
+
+    __aicore__ inline void ColumnStep(uint32_t cnt, uint8_t rep, uint8_t repVec)
+    {
+        // 成对折叠: 每条指令用DataBlock步长2把相邻两块相加, 掩码保持 N*8 lane。
+        if constexpr (ORDER_SEL == 8) {
+            AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+            AscendC::Add<float, false>(t2_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 4), {1, 2, 2, NB, NB2, NB2});
+            AscendC::Add<float, false>(cs_, t2_, t2_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 8), {1, 2, 2, NB, NB2, NB2});
+        } else if constexpr (ORDER_SEL == 6) {
+            AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+            AscendC::Add<float, false>(t2_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 6), {1, 3, 3, NB, 18, 18});
+            AscendC::Add<float, false>(cs_, t2_, t1_[2 * mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 6), {1, 1, 3, NB, NB, 18});
+        } else {
+            AscendC::Add<float, false>(t1_, mat_, mat_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 2), {1, 2, 2, NB, NB2, NB2});
+            AscendC::Add<float, false>(cs_, t1_, t1_[mhcs::BLK], mhcs::MASK_PH,
+                                       mhcs::CeilDiv(cnt, 4), {1, 2, 2, NB, NB2, NB2});
+        }
+        AscendC::Adds<float, false>(cs_, cs_, eps_, mhcs::MASK_PH, repVec, {1, 1, NB, NB});
+        AscendC::Div<float, false>(mat_, mat_, cs_, mhcs::MASK_PH, rep,
+                                   {1, 1, 0, NB, NB, 1});
+    }
+
+    // ------------------------------------------------------------ 通用兜底路径
+    __aicore__ inline void ComputeGeneric(uint32_t cnt)
     {
         const uint32_t n = order_;
         const uint8_t rep = static_cast<uint8_t>(cnt);
-        const int32_t fullMask = static_cast<int32_t>(n * mhcs::BLK);
+        const int32_t span = static_cast<int32_t>(n * mhcs::BLK);
+        const uint8_t stride = static_cast<uint8_t>(n);
         uint64_t colMask[2] = {mhcs::LaneMask(n, n), 0};
 
-        // --- 初始化: 行方向softmax + eps ---
-        AscendC::BlockReduceMax<float>(rs_, mat_, rep, colMask, 1, 1, static_cast<int32_t>(n));
+        AscendC::BlockReduceMax<float>(rs_, mat_, rep, colMask, 1, 1, stride);
         AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::Sub(mat_, mat_, bct_, colMask, rep,
-                     {1, 1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n), mhcs::BLK});
-        AscendC::Exp(mat_, mat_, colMask, rep,
-                     {1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n)});
-        RowSum(cnt, rep, fullMask, n);
-        RowDivide(rep, fullMask, n);
-        AscendC::Adds(mat_, mat_, eps_, colMask, rep,
-                      {1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n)});
+        AscendC::Sub(mat_, mat_, bct_, colMask, rep, {1, 1, 1, stride, stride, mhcs::BLK});
+        AscendC::Exp(mat_, mat_, colMask, rep, {1, 1, stride, stride});
+        AscendC::BlockReduceSum<float>(rs_, mat_, rep, span, 1, 1, stride);
+        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+        AscendC::Div(mat_, mat_, bct_, span, rep, {1, 1, 1, stride, stride, mhcs::BLK});
+        AscendC::Adds(mat_, mat_, eps_, colMask, rep, {1, 1, stride, stride});
 
-        ColumnStep(cnt, rep, fullMask, n);
+        GenericColumnStep(cnt, rep, span, stride);
         for (uint32_t i = 1; i < iters_; ++i) {
-            RowStep(cnt, rep, fullMask, n);
-            ColumnStep(cnt, rep, fullMask, n);
+            AscendC::BlockReduceSum<float>(rs_, mat_, rep, span, 1, 1, stride);
+            AscendC::Adds(rs_, rs_, eps_, static_cast<int32_t>(cnt * mhcs::BLK));
+            AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
+            AscendC::Div(mat_, mat_, bct_, span, rep, {1, 1, 1, stride, stride, mhcs::BLK});
+            GenericColumnStep(cnt, rep, span, stride);
         }
     }
 
-    __aicore__ inline void RowSum(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
+    __aicore__ inline void GenericColumnStep(uint32_t cnt, uint8_t rep, int32_t span,
+                                             uint8_t stride)
     {
-        AscendC::BlockReduceSum<float>(rs_, mat_, rep, fullMask, 1, 1, static_cast<int32_t>(n));
-    }
-
-    __aicore__ inline void RowDivide(uint8_t rep, int32_t fullMask, uint32_t n)
-    {
-        AscendC::Brcb(bct_, rs_, rep, {1, mhcs::BLK});
-        AscendC::Div(mat_, mat_, bct_, fullMask, rep,
-                     {1, 1, 1, static_cast<uint8_t>(n), static_cast<uint8_t>(n), mhcs::BLK});
-    }
-
-    __aicore__ inline void RowStep(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
-    {
-        RowSum(cnt, rep, fullMask, n);
-        AscendC::Adds(rs_, rs_, eps_, static_cast<int32_t>(cnt * mhcs::BLK));
-        RowDivide(rep, fullMask, n);
-    }
-
-    __aicore__ inline void ColumnStep(uint32_t cnt, uint8_t rep, int32_t fullMask, uint32_t n)
-    {
-        ColumnSum(rep, n);
+        const uint32_t n = order_;
+        AscendC::Add(cs_, mat_, mat_[mhcs::BLK], 8, rep, {1, 1, 1, 1, stride, stride});
+        for (uint32_t r = 2; r < n; ++r) {
+            AscendC::Add(cs_, cs_, mat_[r * mhcs::BLK], 8, rep, {1, 1, 1, 1, 1, stride});
+        }
         AscendC::Adds(cs_, cs_, eps_, static_cast<int32_t>(cnt * mhcs::BLK));
-        AscendC::Div(mat_, mat_, cs_, fullMask, rep,
-                     {1, 1, 0, static_cast<uint8_t>(n), static_cast<uint8_t>(n), 1});
-    }
-
-    // 列方向求和: 折叠 n 个DataBlock。
-    __aicore__ inline void ColumnSum(uint8_t rep, uint32_t n)
-    {
-        if constexpr (ORDER_SEL == 8) {
-            AscendC::Add(t1_, mat_, mat_[4 * mhcs::BLK], 32, rep, {1, 1, 1, 4, 8, 8});
-            AscendC::Add(t2_, t1_, t1_[2 * mhcs::BLK], 16, rep, {1, 1, 1, 2, 4, 4});
-            AscendC::Add(cs_, t2_, t2_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 2, 2});
-        } else if constexpr (ORDER_SEL == 6) {
-            AscendC::Add(t1_, mat_, mat_[3 * mhcs::BLK], 24, rep, {1, 1, 1, 3, 6, 6});
-            AscendC::Add(t2_, t1_, t1_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 3, 3});
-            AscendC::Add(cs_, t2_, t1_[2 * mhcs::BLK], 8, rep, {1, 1, 1, 1, 1, 3});
-        } else if constexpr (ORDER_SEL == 4) {
-            AscendC::Add(t1_, mat_, mat_[2 * mhcs::BLK], 16, rep, {1, 1, 1, 2, 4, 4});
-            AscendC::Add(cs_, t1_, t1_[mhcs::BLK], 8, rep, {1, 1, 1, 1, 2, 2});
-        } else {
-            const uint8_t stride = static_cast<uint8_t>(n);
-            AscendC::Add(cs_, mat_, mat_[mhcs::BLK], 8, rep, {1, 1, 1, 1, stride, stride});
-            for (uint32_t r = 2; r < n; ++r) {
-                AscendC::Add(cs_, cs_, mat_[r * mhcs::BLK], 8, rep, {1, 1, 1, 1, 1, stride});
-            }
-        }
+        AscendC::Div(mat_, mat_, cs_, span, rep, {1, 1, 0, stride, stride, 1});
     }
 
     AscendC::TPipe pipe_;
@@ -262,10 +309,10 @@ private:
     AscendC::GlobalTensor<DT_LOGITS> dstGm_;
     AscendC::LocalTensor<float> mat_;
     AscendC::LocalTensor<float> bct_;
-    AscendC::LocalTensor<float> rs_;
-    AscendC::LocalTensor<float> cs_;
     AscendC::LocalTensor<float> t1_;
     AscendC::LocalTensor<float> t2_;
+    AscendC::LocalTensor<float> rs_;
+    AscendC::LocalTensor<float> cs_;
     AscendC::LocalTensor<DT_LOGITS> stage_;
     uint32_t order_ = 0;
     uint32_t iters_ = 0;
