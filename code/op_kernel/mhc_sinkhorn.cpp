@@ -8,7 +8,7 @@ namespace mhcs {
 
 constexpr uint32_t BLK = 8;            // 一个32B DataBlock容纳的float个数
 constexpr uint32_t MAX_ORDER = 8;      // 支持的最大方阵阶数
-constexpr uint32_t CHUNK = 64;         // 单轮驻留UB的方阵数上限
+constexpr uint32_t CHUNK = 32;         // 单轮驻留UB的方阵数上限
 constexpr uint32_t MAX_REPEAT = 255;   // 单条矢量指令的最大迭代数
 constexpr uint32_t SLACK = 2 * MAX_ORDER;  // 折叠指令跨迭代预读的富余DataBlock数
 constexpr int32_t MASK_PH = 0;         // isSetMask=false 时的掩码占位值
@@ -37,7 +37,10 @@ constexpr uint32_t OFF_MX = OFF_CS + VEC_CAP;
 constexpr uint32_t OFF_RES = OFF_MX + VEC_CAP;
 constexpr uint32_t OFF_STG = OFF_RES + BLK;
 constexpr uint32_t STG_CAP = CHUNK * MAX_ORDER * 2 * BLK;   // 半精度落地区(以float计)
-constexpr uint32_t UB_FLOATS = OFF_STG + STG_CAP;
+constexpr uint32_t IDX_CAP = CHUNK * MAX_ORDER * BLK;       // Gather地址表容量
+constexpr uint32_t OFF_LOFF = OFF_STG + STG_CAP;
+constexpr uint32_t OFF_SOFF = OFF_LOFF + IDX_CAP;
+constexpr uint32_t UB_FLOATS = OFF_SOFF + IDX_CAP;
 
 // 每个DataBlock内前 n 个lane置位、共 blocks 个DataBlock的逐bit掩码。
 __aicore__ inline constexpr uint64_t LaneMask(uint32_t n, uint32_t blocks)
@@ -67,6 +70,9 @@ template <typename DT_LOGITS, uint32_t ORDER_SEL>
 class KernelMhcSinkhorn {
     static constexpr bool FAST = (ORDER_SEL != 0);
     static constexpr bool PACKED = (ORDER_SEL == mhcs::MAX_ORDER);
+    // 阶数小于8时GM上的行不足一个DataBlock; 整块搬入后用一条Gather展开到按块对齐的
+    // 布局, 比逐行下发搬运描述符省下大量访存事务。
+    static constexpr bool SPREAD = FAST && !PACKED;
     static constexpr bool IS_FP32 = AscendC::IsSameType<DT_LOGITS, float>::value;
     static constexpr uint32_t N = FAST ? ORDER_SEL : mhcs::MAX_ORDER;
     static constexpr uint64_t MASK_ALL = mhcs::FullMask(N * mhcs::BLK);
@@ -115,6 +121,49 @@ public:
         res_ = AscendC::LocalTensor<float>(POS, mhcs::OFF_RES * mhcs::FSZ, mhcs::BLK);
         stage_ = AscendC::LocalTensor<DT_LOGITS>(POS, mhcs::OFF_STG * mhcs::FSZ,
                                                  mhcs::STG_CAP * mhcs::FSZ / sizeof(DT_LOGITS));
+        loff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_LOFF * mhcs::FSZ, mhcs::IDX_CAP);
+        soff_ = AscendC::LocalTensor<uint32_t>(POS, mhcs::OFF_SOFF * mhcs::FSZ, mhcs::IDX_CAP);
+        if constexpr (SPREAD) {
+            BuildSpreadTables();
+        }
+    }
+
+    // 展开/回收用的元素地址表, 每次启动构造一次。
+    __aicore__ inline void BuildSpreadTables()
+    {
+        uint32_t mats = (count_ < mhcs::CHUNK) ? count_ : mhcs::CHUNK;
+        const int32_t spreadCount = static_cast<int32_t>(mats * N * mhcs::BLK);
+        const int32_t packCount = static_cast<int32_t>(mats * N * N);
+        AscendC::LocalTensor<int32_t> idx = t1_.template ReinterpretCast<int32_t>();
+        AscendC::LocalTensor<int32_t> aux = t2_.template ReinterpretCast<int32_t>();
+        AscendC::LocalTensor<int32_t> lo = loff_.template ReinterpretCast<int32_t>();
+        AscendC::LocalTensor<int32_t> so = soff_.template ReinterpretCast<int32_t>();
+
+        // 展开: 目的元素 i 取自紧凑元素 (i>>3)*n + min(i&7, n-1)。
+        // 越界lane被钳到本行最后一个元素, 由于主循环掩码只覆盖前 n 个lane, 这些
+        // 重复值不参与任何归约或除法。
+        AscendC::CreateVecIndex(idx, 0, spreadCount);
+        AscendC::ShiftRight(aux, idx, 3, spreadCount);
+        AscendC::ShiftLeft(lo, aux, 3, spreadCount);
+        AscendC::Sub(lo, idx, lo, spreadCount);
+        AscendC::Mins(lo, lo, static_cast<int32_t>(N - 1), spreadCount);
+        AscendC::Muls(aux, aux, static_cast<int32_t>(N), spreadCount);
+        AscendC::Add(lo, lo, aux, spreadCount);
+        AscendC::Muls(lo, lo, static_cast<int32_t>(mhcs::FSZ), spreadCount);
+
+        // 回收: 紧凑元素 j 取自展开元素 (j/n)*8 + j%n。n=6的整除用乘移实现。
+        AscendC::CreateVecIndex(idx, 0, packCount);
+        if constexpr (N == 4) {
+            AscendC::ShiftRight(aux, idx, 2, packCount);
+        } else {
+            AscendC::Muls(aux, idx, 43691, packCount);
+            AscendC::ShiftRight(aux, aux, 18, packCount);
+        }
+        AscendC::Muls(so, aux, static_cast<int32_t>(N), packCount);
+        AscendC::Sub(so, idx, so, packCount);
+        AscendC::Muls(aux, aux, static_cast<int32_t>(mhcs::BLK), packCount);
+        AscendC::Add(so, so, aux, packCount);
+        AscendC::Muls(so, so, static_cast<int32_t>(mhcs::FSZ), packCount);
     }
 
     __aicore__ inline void Process()
@@ -170,6 +219,35 @@ private:
             return;
         }
 
+        if constexpr (SPREAD) {
+            // 紧凑矩阵一次搬入, 再用一条Gather展开成按DataBlock对齐的行布局。
+            const uint32_t packCount = cnt * N * N;
+            AscendC::DataCopyExtParams packParams;
+            packParams.blockCount = 1;
+            packParams.blockLen = packCount * sizeof(DT_LOGITS);
+            packParams.srcStride = 0;
+            packParams.dstStride = 0;
+            packParams.rsv = 0;
+            AscendC::DataCopyPadExtParams<DT_LOGITS> packPad;
+            packPad.isPad = true;
+            packPad.leftPadding = 0;
+            packPad.rightPadding = 0;
+            packPad.paddingValue = static_cast<DT_LOGITS>(0.0f);
+            if constexpr (IS_FP32) {
+                AscendC::DataCopyPad(t2_, srcGm_[done * elems], packParams, packPad);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            } else {
+                AscendC::DataCopyPad(stage_, srcGm_[done * elems], packParams, packPad);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::Cast(t2_, stage_, AscendC::RoundMode::CAST_NONE,
+                              static_cast<int32_t>(packCount));
+            }
+            AscendC::Gather(mat_, t2_, loff_, 0U, cnt * N * mhcs::BLK);
+            return;
+        }
+
         AscendC::DataCopyExtParams copyParams;
         copyParams.blockCount = static_cast<uint16_t>(cnt * n);
         copyParams.blockLen = n * sizeof(DT_LOGITS);
@@ -221,6 +299,29 @@ private:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::DataCopy(dstGm_[done * elems], stage_, elemCount);
+            }
+            return;
+        }
+
+        if constexpr (SPREAD) {
+            const uint32_t packCount = cnt * N * N;
+            AscendC::Gather(t2_, mat_, soff_, 0U, packCount);
+            if constexpr (!IS_FP32) {
+                AscendC::Cast(stage_, t2_, AscendC::RoundMode::CAST_RINT,
+                              static_cast<int32_t>(packCount));
+            }
+            AscendC::DataCopyExtParams packParams;
+            packParams.blockCount = 1;
+            packParams.blockLen = packCount * sizeof(DT_LOGITS);
+            packParams.srcStride = 0;
+            packParams.dstStride = 0;
+            packParams.rsv = 0;
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            if constexpr (IS_FP32) {
+                AscendC::DataCopyPad(dstGm_[done * elems], t2_, packParams);
+            } else {
+                AscendC::DataCopyPad(dstGm_[done * elems], stage_, packParams);
             }
             return;
         }
@@ -433,6 +534,8 @@ private:
     AscendC::LocalTensor<float> mx_;
     AscendC::LocalTensor<float> res_;
     AscendC::LocalTensor<DT_LOGITS> stage_;
+    AscendC::LocalTensor<uint32_t> loff_;
+    AscendC::LocalTensor<uint32_t> soff_;
     uint32_t order_ = 0;
     uint32_t iters_ = 0;
     uint32_t count_ = 0;
