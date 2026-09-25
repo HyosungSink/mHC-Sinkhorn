@@ -656,8 +656,8 @@ public:
                 bool outputForProbe = false;
                 if constexpr (sizeof(DT_X) == sizeof(half)) {
                     if (omitSmallEpsilon && iterations >= 5U && (iteration == 2U || iteration == 3U)) {
-                        uint64_t selected = 0;
-                        GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
+                        GatherMask(compact, mat, pattern.template ReinterpretCast<float>(),
+                            static_cast<uint8_t>(0), {1, 1, 8, 0});
                         if (provisionalOutput) {
                             PipeBarrier<PIPE_MTE3>();
                             SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
