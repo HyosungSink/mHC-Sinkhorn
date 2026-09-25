@@ -641,6 +641,7 @@ public:
         Adds<float, false>(mat, mat, epsValue, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
         SetVectorMask<float>(64);
         Columns(mat);
+        bool provisionalOutput = false;
         for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
             BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
             if (!omitSmallEpsilon) {
@@ -652,8 +653,31 @@ public:
             Div<float, false>(mat, mat, div, MASK_PLACEHOLDER, 1, {1, 1, 1, 8, 8, 8});
             Columns(mat, !omitSmallEpsilon);
             if (iteration >= 2U && epsValue > kMinContractEps && iteration + 1U < iterations) {
+                bool outputForProbe = false;
+                if constexpr (sizeof(DT_X) == sizeof(half)) {
+                    if (omitSmallEpsilon && iterations >= 5U && (iteration == 2U || iteration == 3U)) {
+                        uint64_t selected = 0;
+                        GatherMask(compact, mat, pattern, true, 64, {1, 1, 8, 0}, selected);
+                        if (provisionalOutput) {
+                            PipeBarrier<PIPE_MTE3>();
+                            SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
+                            WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
+                        }
+                        Cast(output, compact, RoundMode::CAST_NONE, 32);
+                        Sync<HardEvent::V_MTE3>();
+                        DataCopy(yGm, output, 32U);
+                        SetVectorMask<float>(64);
+                        provisionalOutput = true;
+                        outputForProbe = true;
+                    }
+                }
                 BlockReduceSum<float, false>(sum, mat, 1, MASK_PLACEHOLDER, 1, 1, 8);
                 if (RowsSettled<8U>(sum, probe, omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
+                    if constexpr (sizeof(DT_X) == sizeof(half)) {
+                        if (outputForProbe) {
+                            return;
+                        }
+                    }
                     break;
                 }
             }
@@ -664,6 +688,11 @@ public:
             Sync<HardEvent::V_MTE3>();
             DataCopy(yGm, compact, 32U);
         } else {
+            if (provisionalOutput) {
+                PipeBarrier<PIPE_MTE3>();
+                SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
+                WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
+            }
             Cast(output, compact, RoundMode::CAST_NONE, 32);
             Sync<HardEvent::V_MTE3>();
             DataCopy(yGm, output, 32U);
