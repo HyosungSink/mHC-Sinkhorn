@@ -382,8 +382,13 @@ class KernelMhcSinkhornPair {
             Add<float, false>(a, mat, mat[8], MASK_PLACEHOLDER, 2, {1, 2, 2, 8, 16, 16});
             SetVectorMask<float>(32);
             Add<float, false>(b, a, a[8], MASK_PLACEHOLDER, 1, {1, 3, 3, 8, 24, 24});
+            if (!addEpsilon) {
+                SetVectorMask<float>(0ULL, 0x000000003F3F3F3FULL);
+            }
             Add<float, false>(col, b, a[16], MASK_PLACEHOLDER, 1, {1, 1, 3, 8, 8, 24});
-            Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
+            if (addEpsilon) {
+                Add<float, false>(col, col, At<float>(12288), MASK_PLACEHOLDER, 1, {1, 1, 0, 8, 8, 0});
+            }
             SetVectorMask<float>(48);
             Div<float, false>(mat, mat, col, MASK_PLACEHOLDER, kBatch, {1, 1, 0, 6, 6, 1});
             SetVectorMask<float>(64);
@@ -422,9 +427,9 @@ public:
         auto pattern = At<uint32_t>(21248);
         auto probe = At<float>(22528);
         auto output = At<DT_X>(24576);
-        // Bound later default-eps perturbations below float16 relative precision.
-        constexpr uint32_t kEpsilonBudgetUnits = 850U;
-        const bool omitSmallEpsilon = N == 8U && sizeof(DT_X) == sizeof(half) &&
+        // Use separate default-eps iteration budgets for each matrix order.
+        constexpr uint32_t kEpsilonBudgetUnits = N == 6U ? 1300U : 850U;
+        const bool omitSmallEpsilon = (N == 6U || N == 8U) && sizeof(DT_X) == sizeof(half) &&
             epsValue == 1.0e-6F && iterations <= 1U + kEpsilonBudgetUnits / (2U * N + 1U);
         if constexpr (sizeof(DT_X) == sizeof(float)) {
             auto input = N < 8U ? compact : mat;
@@ -437,49 +442,34 @@ public:
             Duplicate(cons, epsValue, N);
             Duplicate(pattern, 0x3F3F3F3FU, 8);
             auto offsets = At<int32_t>(20480);
-            constexpr int32_t kGatherOffsetDivisor = N == 6U && sizeof(DT_X) == sizeof(half) ? 2 : 1;
             Duplicate(offsets, static_cast<int32_t>(0), 64);
             SetVectorMask<int32_t>(0ULL, 0xAAAAAAAAAAAAAAAAULL);
-            Adds<int32_t, false>(offsets, offsets, 4 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 4, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(0ULL, 0xCCCCCCCCCCCCCCCCULL);
-            Adds<int32_t, false>(offsets, offsets, 8 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 8, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(0ULL, 0xF0F0F0F0F0F0F0F0ULL);
-            Adds<int32_t, false>(offsets, offsets, 16 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 16, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(0ULL, 0xFF00FF00FF00FF00ULL);
-            Adds<int32_t, false>(offsets, offsets, 24 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 24, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(0ULL, 0xFFFF0000FFFF0000ULL);
-            Adds<int32_t, false>(offsets, offsets, 48 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 48, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(0ULL, 0xFFFFFFFF00000000ULL);
-            Adds<int32_t, false>(offsets, offsets, 96 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets, offsets, 96, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
             SetVectorMask<int32_t>(64);
-            Adds<int32_t, false>(offsets[64], offsets, 192 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-            Adds<int32_t, false>(offsets[128], offsets, 384 / kGatherOffsetDivisor, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
-            if constexpr (N == 6U && sizeof(DT_X) == sizeof(half)) {
-                auto paddedInput = At<DT_X>(14336);
-                Duplicate(paddedInput, static_cast<DT_X>(kNegHuge), kGroupLanes);
-            } else {
-                Duplicate(mat, kNegHuge, kGroupLanes);
-            }
+            Adds<int32_t, false>(offsets[64], offsets, 192, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Adds<int32_t, false>(offsets[128], offsets, 384, MASK_PLACEHOLDER, 1, {1, 1, 8, 8});
+            Duplicate(mat, kNegHuge, kGroupLanes);
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
         }
         Sync<HardEvent::MTE2_V>();
-        if constexpr (N == 6U && sizeof(DT_X) == sizeof(half)) {
-            auto paddedInput = At<DT_X>(14336);
-            uint64_t firstRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0x3F3F3F3F3F3F3F3FULL};
-            uint64_t finalRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0ULL};
-            Gather(paddedInput, stage, table, 0, firstRows, 1, 8);
-            Gather(paddedInput[128], stage, table[128], 0, finalRows, 1, 8);
-            Cast(mat, paddedInput, RoundMode::CAST_NONE, kGroupLanes);
-        } else {
-            if constexpr (sizeof(DT_X) != sizeof(float)) {
-                auto input = N < 8U ? compact : mat;
-                Cast(input, stage, RoundMode::CAST_NONE, kElements);
-            }
-            if constexpr (N < 8U) {
-                uint64_t validRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0ULL};
-                Gather(mat, compact, table, 0, validRows, kRepeats, 8);
-            }
+        if constexpr (sizeof(DT_X) != sizeof(float)) {
+            auto input = N < 8U ? compact : mat;
+            Cast(input, stage, RoundMode::CAST_NONE, kElements);
+        }
+        if constexpr (N < 8U) {
+            uint64_t validRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0ULL};
+            Gather(mat, compact, table, 0, validRows, kRepeats, 8);
         }
         SetVectorMask<float>(64);
         BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
@@ -517,7 +507,8 @@ public:
             if constexpr (N == 6U) {
                 if (iteration + 1U < iterations) {
                     BlockReduceSum<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
-                    if (iteration >= 2U && epsValue > kMinContractEps && RowsSettled<kRows * kBatch>(sum, probe)) {
+                    if (iteration >= 2U && epsValue > kMinContractEps && RowsSettled<kRows * kBatch>(sum, probe,
+                        omitSmallEpsilon ? 9.0e-4F : kSettledDev)) {
                         break;
                     }
                 }
