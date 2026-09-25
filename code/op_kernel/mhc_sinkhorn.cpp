@@ -363,7 +363,7 @@ private:
 };
 
 template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true, bool SPECULATE_OUTPUT = false,
-          bool EARLY_HALF_INPUT = false>
+          bool EARLY_HALF_INPUT = false, uint32_t SPREAD_GROUPS = 0U>
 class KernelMhcSinkhornPair {
     static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
@@ -415,7 +415,15 @@ public:
                                     uint32_t iterations, float epsValue) {
         GlobalTensor<DT_X> xGm;
         GlobalTensor<DT_X> yGm;
-        const uint64_t first = static_cast<uint64_t>(GetBlockIdx()) * kBatch;
+        uint64_t first = 0U;
+        if constexpr (SPREAD_GROUPS > 1U) {
+            const uint32_t rawId = static_cast<uint32_t>(GetBlockIdx());
+            const uint32_t groupId = static_cast<uint32_t>(GetBlockNum()) >= 2U * SPREAD_GROUPS ?
+                rawId >> 1U : rawId;
+            first = static_cast<uint64_t>(groupId) * kBatch;
+        } else {
+            first = static_cast<uint64_t>(GetBlockIdx()) * kBatch;
+        }
         xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(x) + first * N * N);
         yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DT_X *>(y) + first * N * N);
         auto mat = At<float>(0);
@@ -721,8 +729,22 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
                                         GM_ADDR tiling) {
     REGISTER_TILING_DEFAULT(MhcSinkhornTilingData);
     if constexpr (GROUP_ORDER != 0U && ACTIVE_GROUPS != 0U) {
-        if (static_cast<uint32_t>(GetBlockIdx()) >= ACTIVE_GROUPS) {
-            return;
+        if constexpr (GROUP_ORDER == 6U && sizeof(DT_X) == sizeof(half) && ACTIVE_GROUPS > 1U) {
+            const uint32_t blockId = static_cast<uint32_t>(GetBlockIdx());
+            uint32_t groupId = blockId;
+            if (static_cast<uint32_t>(GetBlockNum()) >= 2U * ACTIVE_GROUPS) {
+                if ((blockId & 1U) != 0U) {
+                    return;
+                }
+                groupId = blockId >> 1U;
+            }
+            if (groupId >= ACTIVE_GROUPS) {
+                return;
+            }
+        } else {
+            if (static_cast<uint32_t>(GetBlockIdx()) >= ACTIVE_GROUPS) {
+                return;
+            }
         }
         // Static groups contain no partial matrix group; the Host checks this.
         __gm__ const MhcSinkhornTilingData *groupData =
@@ -738,7 +760,10 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
                 (ACTIVE_GROUPS == 1U || STATIC_ITERATIONS <= 30U);
             constexpr bool earlyHalfInput = GROUP_ORDER == 8U &&
                 ACTIVE_GROUPS == 1U && STATIC_ITERATIONS != 0U;
-            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, speculateOutput, earlyHalfInput> op;
+            constexpr uint32_t spreadGroups = GROUP_ORDER == 6U &&
+                sizeof(DT_X) == sizeof(half) && ACTIVE_GROUPS > 1U ? ACTIVE_GROUPS : 0U;
+            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, speculateOutput,
+                earlyHalfInput, spreadGroups> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         }
         PipeBarrier<PIPE_ALL>();
