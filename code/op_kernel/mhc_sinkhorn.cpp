@@ -362,7 +362,8 @@ private:
     uint32_t iterations_ = 0;
 };
 
-template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true, bool SPECULATE_OUTPUT = false>
+template <typename DT_X, uint32_t N, bool FULL_COLUMN_MASK = true, bool SPECULATE_OUTPUT = false,
+          bool EARLY_HALF_INPUT = false>
 class KernelMhcSinkhornPair {
     static constexpr uint32_t kBatch = 4U;
     static constexpr uint32_t kElements = kBatch * N * N;
@@ -462,8 +463,21 @@ public:
         } else {
             Duplicate(cons, epsValue, 8U * kBatch);
         }
+        constexpr bool kN8HalfInput = EARLY_HALF_INPUT && N == 8U && sizeof(DT_X) == sizeof(half);
+        constexpr bool kN6HalfInput = N == 6U && sizeof(DT_X) == sizeof(half);
+        if constexpr (kN8HalfInput) {
+            SetVectorMask<float>(64);
+        } else if constexpr (kN6HalfInput) {
+            SetVectorMask<float>(48);
+        }
         Sync<HardEvent::MTE2_V>();
-        if constexpr (sizeof(DT_X) != sizeof(float)) {
+        if constexpr (kN8HalfInput) {
+            Cast<float, DT_X, false>(mat, stage, RoundMode::CAST_NONE,
+                MASK_PLACEHOLDER, kRepeats, {1, 1, 8, 4});
+        } else if constexpr (kN6HalfInput) {
+            Cast<float, DT_X, false>(compact, stage, RoundMode::CAST_NONE,
+                MASK_PLACEHOLDER, 3, {1, 1, 6, 3});
+        } else if constexpr (sizeof(DT_X) != sizeof(float)) {
             auto input = N < 8U ? compact : mat;
             Cast(input, stage, RoundMode::CAST_NONE, kElements);
         }
@@ -471,7 +485,9 @@ public:
             uint64_t validRows[2] = {0x3F3F3F3F3F3F3F3FULL, 0ULL};
             Gather(mat, compact, table, 0, validRows, kRepeats, 8);
         }
-        SetVectorMask<float>(64);
+        if constexpr (!kN8HalfInput) {
+            SetVectorMask<float>(64);
+        }
         BlockReduceMax<float, false>(sum, mat, kRepeats, MASK_PLACEHOLDER, 1, 1, 8);
         Brcb(div, sum, kRepeats, BrcbRepeatParams(1, 8));
         Sub<float, false>(mat, mat, div, MASK_PLACEHOLDER, kRepeats, {1, 1, 1, 8, 8, 8});
@@ -720,7 +736,9 @@ __global__ __aicore__ void mhc_sinkhorn(GM_ADDR logits, GM_ADDR mask, GM_ADDR we
             constexpr bool speculateOutput = GROUP_ORDER == 8U &&
                 ACTIVE_GROUPS != 0U && STATIC_ITERATIONS != 0U &&
                 (ACTIVE_GROUPS == 1U || STATIC_ITERATIONS <= 30U);
-            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, speculateOutput> op;
+            constexpr bool earlyHalfInput = GROUP_ORDER == 8U &&
+                ACTIVE_GROUPS == 1U && STATIC_ITERATIONS != 0U;
+            KernelMhcSinkhornPair<DT_X, GROUP_ORDER, true, speculateOutput, earlyHalfInput> op;
             op.Process(logits, weights, tiling, iterations, epsValue);
         }
         PipeBarrier<PIPE_ALL>();
